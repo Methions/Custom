@@ -1,0 +1,1145 @@
+local API = {}
+
+local GA = _G.__GARBO_APEX_STATE or {}
+_G.__GARBO_APEX_STATE = GA
+GA.MaxDepth = GA.MaxDepth or 24
+GA.NodeLimit = GA.NodeLimit or 5000000
+GA.TimeLimit = GA.TimeLimit or 3      -- wall-clock seconds per move
+GA.Slice = GA.Slice or 0.010          -- max seconds of work before yielding to Roblox (anti-lag)
+GA.LastDepth, GA.LastScore, GA.LastNodes, GA.LastPV = 0, 0, 0, ""
+
+local band = bit32.band
+local OFF = 100
+local INF = 1000000
+local MATE = 30000
+local MATEB = MATE - 200
+local MAXPLY = 96
+
+local board = {}
+for i = 1, 120 do board[i] = OFF end
+local sqList = {}
+for r = 2, 9 do for c = 2, 9 do sqList[#sqList + 1] = r * 10 + c end end
+
+local KNOFF = { -21, -19, -12, -8, 8, 12, 19, 21 }
+local KGOFF = { -11, -10, -9, -1, 1, 9, 10, 11 }
+local BDIR = { -11, -9, 9, 11 }
+local RDIR = { -10, -1, 1, 10 }
+local QDIR = { -11, -9, 9, 11, -10, -1, 1, 10 }
+
+local side, castle, epSq, halfmove = 0, 0, 0, 0
+local hashKey = 0
+local kingSq = { 0, 0 }
+local npm = { 0, 0 }              -- non-pawn piece counts
+local mgScore, egScore, phase = 0, 0, 0
+local sp = 0
+
+local cmask = {}
+for i = 1, 120 do cmask[i] = 15 end
+cmask[96] = 12; cmask[99] = 14; cmask[92] = 13
+cmask[26] = 3;  cmask[29] = 11; cmask[22] = 7
+
+-- undo stacks
+local uHash, uCastle, uEp, uHalf, uMg, uEg, uPh, uN0, uN1, uCapt, hist = {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+
+local rngState = 1234567
+local function rnd()
+    rngState = (rngState * 16807) % 2147483647
+    return rngState
+end
+local function rnd40() return (rnd() % 1048576) * 1048576 + (rnd() % 1048576) end
+
+local zPiece, zEp, zCastle = {}, {}, {}
+local zSide = rnd40()
+for i = 1, 14 * 128 + 128 do zPiece[i] = 0 end
+for p = 1, 14 do
+    if p ~= 7 and p ~= 8 then
+        for s = 1, 120 do zPiece[p * 128 + s] = rnd40() end
+    end
+end
+for s = 1, 120 do zEp[s] = rnd40() end
+for i = 0, 15 do zCastle[i] = rnd40() end
+
+local PST_MG = {
+ { 0,0,0,0,0,0,0,0, 98,134,61,95,68,126,34,-11, -6,7,26,31,65,56,25,-20, -14,13,6,21,23,12,17,-23,
+   -27,-2,-5,12,17,6,10,-25, -26,-4,-4,-10,3,3,33,-12, -35,-1,-20,-23,-15,24,38,-22, 0,0,0,0,0,0,0,0 },
+ { -167,-89,-34,-49,61,-97,-15,-107, -73,-41,72,36,23,62,7,-17, -47,60,37,65,84,129,73,44, -9,17,19,53,37,69,18,22,
+   -13,4,16,13,28,19,21,-8, -23,-9,12,10,19,17,25,-16, -29,-53,-12,-3,-1,18,-14,-19, -105,-21,-58,-33,-17,-28,-19,-23 },
+ { -29,4,-82,-37,-25,-42,7,-8, -26,16,-18,-13,30,59,18,-47, -16,37,43,40,35,50,37,-2, -4,5,19,50,37,37,7,-2,
+   -6,13,13,26,34,12,10,4, 0,15,15,15,14,27,18,10, 4,15,16,0,7,21,33,1, -33,-3,-14,-21,-13,-12,-39,-21 },
+ { 32,42,32,51,63,9,31,43, 27,32,58,62,80,67,26,44, -5,19,26,36,17,45,61,16, -24,-11,7,26,24,35,-8,-20,
+   -36,-26,-12,-1,9,-7,6,-23, -45,-25,-16,-17,3,0,-5,-33, -44,-16,-20,-9,-1,11,-6,-71, -19,-13,1,17,16,7,-37,-26 },
+ { -28,0,29,12,59,44,43,45, -24,-39,-5,1,-16,57,28,54, -13,-17,7,8,29,56,47,57, -27,-27,-16,-16,-1,17,-2,1,
+   -9,-26,-9,-10,-2,-4,3,-3, -14,2,-11,-2,-5,2,14,5, -35,-8,11,2,8,15,-3,1, -1,-18,-9,10,-15,-25,-31,-50 },
+ { -65,23,16,-15,-56,-34,2,13, 29,-1,-20,-7,-8,-4,-38,-29, -9,24,2,-16,-20,6,22,-22, -17,-20,-12,-27,-30,-25,-14,-36,
+   -49,-1,-27,-39,-46,-44,-33,-51, -14,-14,-22,-46,-44,-30,-15,-27, 1,7,-8,-64,-43,-16,9,8, -15,36,12,-54,8,-28,24,14 },
+}
+local PST_EG = {
+ { 0,0,0,0,0,0,0,0, 178,173,158,134,147,132,165,187, 94,100,85,67,56,53,82,84, 32,24,13,5,-2,4,17,17,
+   13,9,-3,-7,-7,-8,3,-1, 4,7,-6,1,0,-5,-1,-8, 13,8,8,10,13,0,2,-7, 0,0,0,0,0,0,0,0 },
+ { -58,-38,-13,-28,-31,-27,-63,-99, -25,-8,-25,-2,-9,-25,-24,-52, -24,-20,10,9,-1,-9,-19,-41, -17,3,22,22,22,11,8,-18,
+   -18,-6,16,25,16,17,4,-18, -23,-3,-1,15,10,-3,-20,-22, -42,-20,-10,-5,-2,-20,-23,-44, -29,-51,-23,-15,-22,-18,-50,-64 },
+ { -14,-21,-11,-8,-7,-9,-17,-24, -8,-4,7,-12,-3,-13,-4,-14, 2,-8,0,-1,-2,6,0,4, -3,9,12,9,14,10,3,2,
+   -6,3,13,19,7,10,-3,-9, -12,-3,8,10,13,3,-7,-15, -14,-18,-7,-1,4,-9,-15,-27, -23,-9,-23,-5,-9,-16,-5,-17 },
+ { 13,10,18,15,12,12,8,5, 11,13,13,11,-3,3,8,3, 7,7,7,5,4,-3,-5,-3, 4,3,13,1,2,1,-1,2,
+   3,5,8,4,-5,-6,-8,-11, -4,0,-5,-1,-7,-12,-8,-16, -6,-6,0,2,-9,-9,-11,-3, -9,2,3,-1,-5,-13,4,-20 },
+ { -9,22,22,27,27,19,10,20, -17,20,32,41,58,25,30,0, -20,6,9,49,47,35,19,9, 3,22,24,45,57,40,57,36,
+   -18,28,19,47,31,34,39,23, -16,-27,15,6,9,17,10,5, -22,-23,-30,-16,-16,-23,-36,-32, -33,-28,-22,-43,-5,-32,-20,-41 },
+ { -74,-35,-18,-18,-11,15,4,-17, -12,17,14,17,17,38,23,11, 10,17,23,15,20,45,44,13, -8,22,24,27,26,33,26,3,
+   -18,-4,21,24,27,23,9,-11, -19,-3,11,21,23,16,7,-9, -27,-11,4,13,14,4,-5,-17, -53,-34,-21,-11,-28,-14,-24,-43 },
+}
+local MAT_MG = { 82, 337, 365, 477, 1025, 0 }
+local MAT_EG = { 94, 281, 297, 512, 936, 0 }
+local phW = { [0] = 0, 0, 1, 1, 2, 4, 0 }   -- phase weight by piece type
+
+local vMg, vEg = {}, {}
+for i = 1, 14 * 128 + 128 do vMg[i] = 0; vEg[i] = 0 end
+for _, sq in ipairs(sqList) do
+    local rankIdx = sq // 10 - 2
+    local file = sq % 10 - 2
+    for t = 1, 6 do
+        local iw = rankIdx * 8 + file + 1
+        local ib = (7 - rankIdx) * 8 + file + 1
+        vMg[t * 128 + sq] = MAT_MG[t] + PST_MG[t][iw]
+        vEg[t * 128 + sq] = MAT_EG[t] + PST_EG[t][iw]
+        vMg[(t + 8) * 128 + sq] = -(MAT_MG[t] + PST_MG[t][ib])
+        vEg[(t + 8) * 128 + sq] = -(MAT_EG[t] + PST_EG[t][ib])
+    end
+end
+
+local cdist = {}
+for _, sq in ipairs(sqList) do
+    local f, r = sq % 10 - 2, sq // 10 - 2
+    cdist[sq] = math.max(3 - f, f - 4) + math.max(3 - r, r - 4)
+end
+
+local function attacked(sq, by)
+    if by == 0 then
+        if board[sq + 9] == 1 or board[sq + 11] == 1 then return true end
+    else
+        if board[sq - 9] == 9 or board[sq - 11] == 9 then return true end
+    end
+    local base = (by == 0) and 0 or 8
+    local nk, kg, bi, ro, qu = base + 2, base + 6, base + 3, base + 4, base + 5
+    for k = 1, 8 do
+        if board[sq + KNOFF[k]] == nk then return true end
+        if board[sq + KGOFF[k]] == kg then return true end
+    end
+    for k = 1, 4 do
+        local d = BDIR[k]
+        local s = sq + d
+        local q = board[s]
+        while q == 0 do s = s + d; q = board[s] end
+        if q == bi or q == qu then return true end
+        d = RDIR[k]
+        s = sq + d
+        q = board[s]
+        while q == 0 do s = s + d; q = board[s] end
+        if q == ro or q == qu then return true end
+    end
+    return false
+end
+
+local moves, mscore, qlist = {}, {}, {}
+for i = 0, 135 do moves[i] = {}; mscore[i] = {}; qlist[i] = {} end
+
+local function genMoves(ply, capsOnly)
+    local ml = moves[ply]
+    local n = 0
+    local mlo, mhi, elo, ehi, pdir, startRow, promoRow, base
+    if side == 0 then
+        mlo, mhi, elo, ehi, pdir, startRow, promoRow, base = 1, 6, 9, 14, -10, 8, 2, 0
+    else
+        mlo, mhi, elo, ehi, pdir, startRow, promoRow, base = 9, 14, 1, 6, 10, 3, 9, 8
+    end
+    for i = 1, 64 do
+        local sq = sqList[i]
+        local p = board[sq]
+        if p >= mlo and p <= mhi then
+            local t = p - base
+            if t == 1 then
+                for k = -1, 1, 2 do
+                    local to = sq + pdir + k
+                    local q = board[to]
+                    if q >= elo and q <= ehi then
+                        if to // 10 == promoRow then
+                            local b = sq + to * 128
+                            ml[n + 1] = b + 8 * 16384; ml[n + 2] = b + 7 * 16384
+                            ml[n + 3] = b + 6 * 16384; ml[n + 4] = b + 5 * 16384
+                            n = n + 4
+                        else
+                            n = n + 1; ml[n] = sq + to * 128
+                        end
+                    elseif to == epSq then
+                        n = n + 1; ml[n] = sq + to * 128 + 2 * 16384
+                    end
+                end
+                local to = sq + pdir
+                if board[to] == 0 then
+                    if to // 10 == promoRow then
+                        local b = sq + to * 128
+                        n = n + 1; ml[n] = b + 8 * 16384
+                        if not capsOnly then
+                            ml[n + 1] = b + 7 * 16384; ml[n + 2] = b + 6 * 16384; ml[n + 3] = b + 5 * 16384
+                            n = n + 3
+                        end
+                    elseif not capsOnly then
+                        n = n + 1; ml[n] = sq + to * 128
+                        if sq // 10 == startRow then
+                            local to2 = to + pdir
+                            if board[to2] == 0 then
+                                n = n + 1; ml[n] = sq + to2 * 128 + 16384
+                            end
+                        end
+                    end
+                end
+            elseif t == 2 or t == 6 then
+                local offs = (t == 2) and KNOFF or KGOFF
+                for k = 1, 8 do
+                    local to = sq + offs[k]
+                    local q = board[to]
+                    if q == 0 then
+                        if not capsOnly then n = n + 1; ml[n] = sq + to * 128 end
+                    elseif q >= elo and q <= ehi then
+                        n = n + 1; ml[n] = sq + to * 128
+                    end
+                end
+                if t == 6 and not capsOnly then
+                    if side == 0 then
+                        if sq == 96 and band(castle, 3) ~= 0 and not attacked(96, 1) then
+                            if band(castle, 1) ~= 0 and board[97] == 0 and board[98] == 0 and not attacked(97, 1) then
+                                n = n + 1; ml[n] = 96 + 98 * 128 + 3 * 16384
+                            end
+                            if band(castle, 2) ~= 0 and board[95] == 0 and board[94] == 0 and board[93] == 0 and not attacked(95, 1) then
+                                n = n + 1; ml[n] = 96 + 94 * 128 + 4 * 16384
+                            end
+                        end
+                    else
+                        if sq == 26 and band(castle, 12) ~= 0 and not attacked(26, 0) then
+                            if band(castle, 4) ~= 0 and board[27] == 0 and board[28] == 0 and not attacked(27, 0) then
+                                n = n + 1; ml[n] = 26 + 28 * 128 + 3 * 16384
+                            end
+                            if band(castle, 8) ~= 0 and board[25] == 0 and board[24] == 0 and board[23] == 0 and not attacked(25, 0) then
+                                n = n + 1; ml[n] = 26 + 24 * 128 + 4 * 16384
+                            end
+                        end
+                    end
+                end
+            else
+                local dirs, nd
+                if t == 3 then dirs, nd = BDIR, 4
+                elseif t == 4 then dirs, nd = RDIR, 4
+                else dirs, nd = QDIR, 8 end
+                for k = 1, nd do
+                    local d = dirs[k]
+                    local to = sq + d
+                    local q = board[to]
+                    while q == 0 do
+                        if not capsOnly then n = n + 1; ml[n] = sq + to * 128 end
+                        to = to + d
+                        q = board[to]
+                    end
+                    if q >= elo and q <= ehi then n = n + 1; ml[n] = sq + to * 128 end
+                end
+            end
+        end
+    end
+    return n
+end
+
+local unmakeMove
+
+local function makeMove(m)
+    local from = m % 128
+    local to = (m // 128) % 128
+    local fl = m // 16384
+    local p = board[from]
+    local us = side
+    local cap = board[to]
+    sp = sp + 1
+    uHash[sp] = hashKey; uCastle[sp] = castle; uEp[sp] = epSq; uHalf[sp] = halfmove
+    uMg[sp] = mgScore; uEg[sp] = egScore; uPh[sp] = phase; uN0[sp] = npm[1]; uN1[sp] = npm[2]
+    if epSq ~= 0 then hashKey = hashKey - zEp[epSq]; epSq = 0 end
+    hashKey = hashKey - zCastle[castle]
+    halfmove = halfmove + 1
+    local t = p % 8
+    if t == 1 then halfmove = 0 end
+    board[from] = 0
+    local pi = p * 128 + from
+    hashKey = hashKey - zPiece[pi]
+    mgScore = mgScore - vMg[pi]; egScore = egScore - vEg[pi]
+    if fl == 2 then
+        local cs = (us == 0) and (to + 10) or (to - 10)
+        local cp = board[cs]
+        board[cs] = 0
+        local ci = cp * 128 + cs
+        hashKey = hashKey - zPiece[ci]
+        mgScore = mgScore - vMg[ci]; egScore = egScore - vEg[ci]
+        uCapt[sp] = cp
+        halfmove = 0
+    elseif cap ~= 0 then
+        local ci = cap * 128 + to
+        hashKey = hashKey - zPiece[ci]
+        mgScore = mgScore - vMg[ci]; egScore = egScore - vEg[ci]
+        local ct = cap % 8
+        phase = phase - phW[ct]
+        if ct ~= 1 then
+            local c = (cap > 8) and 2 or 1
+            npm[c] = npm[c] - 1
+        end
+        uCapt[sp] = cap
+        halfmove = 0
+    else
+        uCapt[sp] = 0
+    end
+    local np = p
+    if fl >= 5 then
+        local pt = fl - 3
+        np = (us == 0) and pt or (pt + 8)
+        phase = phase + phW[pt]
+        npm[us + 1] = npm[us + 1] + 1
+    end
+    board[to] = np
+    local ni = np * 128 + to
+    hashKey = hashKey + zPiece[ni]
+    mgScore = mgScore + vMg[ni]; egScore = egScore + vEg[ni]
+    if t == 6 then kingSq[us + 1] = to end
+    if fl == 1 then
+        epSq = (from + to) // 2
+        hashKey = hashKey + zEp[epSq]
+    elseif fl == 3 or fl == 4 then
+        local rf, rt
+        if fl == 3 then rf, rt = to + 1, to - 1 else rf, rt = to - 2, to + 1 end
+        local rp = board[rf]
+        board[rf] = 0
+        board[rt] = rp
+        local a, b = rp * 128 + rf, rp * 128 + rt
+        hashKey = hashKey - zPiece[a] + zPiece[b]
+        mgScore = mgScore - vMg[a] + vMg[b]; egScore = egScore - vEg[a] + vEg[b]
+    end
+    castle = band(castle, cmask[from], cmask[to])
+    hashKey = hashKey + zCastle[castle]
+    side = 1 - us
+    if side == 1 then hashKey = hashKey + zSide else hashKey = hashKey - zSide end
+    hist[sp] = hashKey
+    if attacked(kingSq[us + 1], side) then
+        unmakeMove(m)
+        return false
+    end
+    return true
+end
+
+unmakeMove = function(m)
+    local from = m % 128
+    local to = (m // 128) % 128
+    local fl = m // 16384
+    local us = 1 - side
+    local p = board[to]
+    if fl >= 5 then p = (us == 0) and 1 or 9 end
+    board[from] = p
+    local cap = uCapt[sp]
+    if fl == 2 then
+        board[to] = 0
+        board[(us == 0) and (to + 10) or (to - 10)] = cap
+    else
+        board[to] = cap
+    end
+    if fl == 3 then
+        board[to + 1] = board[to - 1]; board[to - 1] = 0
+    elseif fl == 4 then
+        board[to - 2] = board[to + 1]; board[to + 1] = 0
+    end
+    if p % 8 == 6 then kingSq[us + 1] = from end
+    castle = uCastle[sp]; epSq = uEp[sp]; halfmove = uHalf[sp]; hashKey = uHash[sp]
+    mgScore = uMg[sp]; egScore = uEg[sp]; phase = uPh[sp]; npm[1] = uN0[sp]; npm[2] = uN1[sp]
+    side = us
+    sp = sp - 1
+end
+
+local function makeNull()
+    sp = sp + 1
+    uEp[sp] = epSq; uHash[sp] = hashKey; uHalf[sp] = halfmove
+    if epSq ~= 0 then hashKey = hashKey - zEp[epSq]; epSq = 0 end
+    side = 1 - side
+    if side == 1 then hashKey = hashKey + zSide else hashKey = hashKey - zSide end
+    halfmove = halfmove + 1
+    hist[sp] = hashKey
+end
+
+local function unmakeNull()
+    side = 1 - side
+    epSq = uEp[sp]; hashKey = uHash[sp]; halfmove = uHalf[sp]
+    sp = sp - 1
+end
+
+local function isRepetition()
+    local lim = sp - halfmove
+    if lim < 0 then lim = 0 end
+    local i = sp - 2
+    while i >= lim do
+        if hist[i] == hashKey then return true end
+        i = i - 2
+    end
+    return false
+end
+
+local wCnt, bCnt, wMax, bMin = {}, {}, {}, {}
+local wpS, bpS, wrS, brS = {}, {}, {}, {}
+local PPMG = { 0, 5, 10, 20, 35, 60, 100 }
+local PPEG = { 0, 10, 20, 40, 75, 125, 200 }
+
+local function slideCount(sq, dirs, lo, hi)
+    local cnt = 0
+    for k = 1, 4 do
+        local d = dirs[k]
+        local s = sq + d
+        local q = board[s]
+        while q == 0 do cnt = cnt + 1; s = s + d; q = board[s] end
+        if q >= lo and q <= hi then cnt = cnt + 1 end
+    end
+    return cnt
+end
+
+local function evaluate()
+    for f = 1, 10 do wCnt[f] = 0; bCnt[f] = 0; wMax[f] = 0; bMin[f] = 99 end
+    local nW, nB, nRW, nRB = 0, 0, 0, 0
+    local wm, bm, wBish, bBish = 0, 0, 0, 0
+    local xmg, xeg = 0, 0
+    for i = 1, 64 do
+        local sq = sqList[i]
+        local p = board[sq]
+        if p ~= 0 then
+            local t = p % 8
+            if t == 1 then
+                local f, r = sq % 10, sq // 10
+                if p < 8 then
+                    nW = nW + 1; wpS[nW] = sq; wCnt[f] = wCnt[f] + 1
+                    if r > wMax[f] then wMax[f] = r end
+                else
+                    nB = nB + 1; bpS[nB] = sq; bCnt[f] = bCnt[f] + 1
+                    if r < bMin[f] then bMin[f] = r end
+                end
+            elseif t == 2 then
+                local lo, hi = 1, 6
+                if p < 8 then lo, hi = 9, 14 end
+                local cnt = 0
+                for k = 1, 8 do
+                    local q = board[sq + KNOFF[k]]
+                    if q == 0 or (q >= lo and q <= hi) then cnt = cnt + 1 end
+                end
+                local mob = (cnt - 4) * 4
+                if p < 8 then wm = wm + 320; xmg = xmg + mob; xeg = xeg + mob
+                else bm = bm + 320; xmg = xmg - mob; xeg = xeg - mob end
+            elseif t == 3 then
+                local lo, hi = 1, 6
+                if p < 8 then lo, hi = 9, 14 end
+                local mob = (slideCount(sq, BDIR, lo, hi) - 6) * 3
+                if p < 8 then wm = wm + 330; wBish = wBish + 1; xmg = xmg + mob; xeg = xeg + mob * 2
+                else bm = bm + 330; bBish = bBish + 1; xmg = xmg - mob; xeg = xeg - mob * 2 end
+            elseif t == 4 then
+                local lo, hi = 1, 6
+                if p < 8 then lo, hi = 9, 14 end
+                local mob = slideCount(sq, RDIR, lo, hi) - 7
+                if p < 8 then
+                    wm = wm + 500; nRW = nRW + 1; wrS[nRW] = sq; xmg = xmg + mob * 2; xeg = xeg + mob * 4
+                else
+                    bm = bm + 500; nRB = nRB + 1; brS[nRB] = sq; xmg = xmg - mob * 2; xeg = xeg - mob * 4
+                end
+            elseif t == 5 then
+                if p < 8 then wm = wm + 900 else bm = bm + 900 end
+            end
+        end
+    end
+
+    if nW + nB == 0 and wm <= 330 and bm <= 330 then return 0 end
+
+    -- pawns
+    for k = 1, nW do
+        local sq = wpS[k]
+        local f, r = sq % 10, sq // 10
+        if bMin[f - 1] >= r and bMin[f] >= r and bMin[f + 1] >= r then
+            local rel = 9 - r
+            xmg = xmg + PPMG[rel]; xeg = xeg + PPEG[rel]
+        end
+        if wCnt[f] > 1 then xmg = xmg - 8; xeg = xeg - 16 end
+        if wCnt[f - 1] == 0 and wCnt[f + 1] == 0 then xmg = xmg - 10; xeg = xeg - 14 end
+    end
+    for k = 1, nB do
+        local sq = bpS[k]
+        local f, r = sq % 10, sq // 10
+        if wMax[f - 1] <= r and wMax[f] <= r and wMax[f + 1] <= r then
+            local rel = r - 2
+            xmg = xmg - PPMG[rel]; xeg = xeg - PPEG[rel]
+        end
+        if bCnt[f] > 1 then xmg = xmg + 8; xeg = xeg + 16 end
+        if bCnt[f - 1] == 0 and bCnt[f + 1] == 0 then xmg = xmg + 10; xeg = xeg + 14 end
+    end
+    -- rooks on open files
+    for k = 1, nRW do
+        local f = wrS[k] % 10
+        if wCnt[f] == 0 then
+            if bCnt[f] == 0 then xmg = xmg + 20; xeg = xeg + 10 else xmg = xmg + 10; xeg = xeg + 5 end
+        end
+    end
+    for k = 1, nRB do
+        local f = brS[k] % 10
+        if bCnt[f] == 0 then
+            if wCnt[f] == 0 then xmg = xmg - 20; xeg = xeg - 10 else xmg = xmg - 10; xeg = xeg - 5 end
+        end
+    end
+    if wBish >= 2 then xmg = xmg + 30; xeg = xeg + 50 end
+    if bBish >= 2 then xmg = xmg - 30; xeg = xeg - 50 end
+
+    -- king shelter (middlegame only; scaled by phase automatically)
+    local wk, bk = kingSq[1], kingSq[2]
+    local sh = 0
+    for d = -1, 1 do
+        local s1 = wk - 10 + d
+        local q = board[s1]
+        if q == 1 then sh = sh + 10
+        elseif board[s1 - 10] == 1 then sh = sh + 5
+        elseif q ~= OFF then sh = sh - 8 end
+    end
+    xmg = xmg + sh
+    sh = 0
+    for d = -1, 1 do
+        local s1 = bk + 10 + d
+        local q = board[s1]
+        if q == 9 then sh = sh + 10
+        elseif board[s1 + 10] == 9 then sh = sh + 5
+        elseif q ~= OFF then sh = sh - 8 end
+    end
+    xmg = xmg - sh
+
+    -- mop-up: drive the lone king to the edge when far ahead
+    if wm - bm >= 400 then
+        local kd = math.abs((wk % 10) - (bk % 10)) + math.abs((wk // 10) - (bk // 10))
+        xeg = xeg + 12 * cdist[bk] + 4 * (14 - kd)
+    elseif bm - wm >= 400 then
+        local kd = math.abs((wk % 10) - (bk % 10)) + math.abs((wk // 10) - (bk // 10))
+        xeg = xeg - (12 * cdist[wk] + 4 * (14 - kd))
+    end
+
+    local ph = phase
+    if ph > 24 then ph = 24 elseif ph < 0 then ph = 0 end
+    local score = ((mgScore + xmg) * ph + (egScore + xeg) * (24 - ph)) // 24
+    if side == 0 then return score + 10 end
+    return 10 - score
+end
+
+local TTSIZE = 131072
+local mkarr = table.create or function(n, v) local t = {} for i = 1, n do t[i] = v end return t end
+local ttKey, ttMv, ttSc, ttDp, ttFl, ttAge =
+    mkarr(TTSIZE, 0), mkarr(TTSIZE, 0), mkarr(TTSIZE, 0), mkarr(TTSIZE, 0), mkarr(TTSIZE, 0), mkarr(TTSIZE, 0)
+local ttGen = 0
+
+local hist_ = mkarr(32768, 0)       -- history heuristic [side][from,to]
+local killers1, killers2 = {}, {}
+for i = 0, 135 do killers1[i] = 0; killers2[i] = 0 end
+
+local lmr = {}
+for d = 1, 64 do
+    lmr[d] = {}
+    for mv = 1, 64 do lmr[d][mv] = math.floor(0.75 + math.log(d) * math.log(mv) / 2.25) end
+end
+
+local cv = { 1, 3, 3, 5, 9, 100 }                     -- ordering values by type
+local cpv = { [0] = 0, 100, 320, 330, 500, 900, 0 }   -- centipawn values by type
+
+local nodes, nodeLimit, stopped = 0, 0, false
+local startClock, hardLimit, lastYield, sliceLen = 0, 3, 0, 0.01
+local yieldFn = (task and task.wait) and function() task.wait() end or nil
+
+local function checkStop()
+    local now = os.clock()
+    if now - startClock >= hardLimit or nodes >= nodeLimit then
+        stopped = true
+        return
+    end
+    if yieldFn and now - lastYield >= sliceLen then
+        yieldFn()
+        lastYield = os.clock()
+    end
+end
+
+local function pawnDefended(to)
+    if side == 0 then return board[to - 9] == 9 or board[to - 11] == 9 end
+    return board[to + 9] == 1 or board[to + 11] == 1
+end
+
+local function scoreMoves(ply, n, ttMove)
+    local ml, sc = moves[ply], mscore[ply]
+    local k1, k2 = killers1[ply], killers2[ply]
+    local sideOff = side * 16384 + 1
+    for i = 1, n do
+        local m = ml[i]
+        local from = m % 128
+        local to = (m // 128) % 128
+        local fl = m // 16384
+        local s
+        if m == ttMove then
+            s = 2000000
+        else
+            local cap = board[to]
+            if cap ~= 0 or fl == 2 then
+                local vt = (fl == 2) and 1 or (cap % 8)
+                local at = board[from] % 8
+                s = 1000000 + vt * 16 - at
+                if cv[at] > cv[vt] and pawnDefended(to) then s = s - 1100000 end
+                if fl == 8 then s = s + 20000 end
+            elseif fl >= 5 then
+                s = (fl == 8) and 1050000 or -50000
+            elseif m == k1 then
+                s = 900000
+            elseif m == k2 then
+                s = 800000
+            else
+                s = hist_[m % 16384 + sideOff]
+            end
+        end
+        sc[i] = s
+    end
+end
+
+local function pick(ply, i, n)
+    local ml, sc = moves[ply], mscore[ply]
+    local bi, bs = i, sc[i]
+    for j = i + 1, n do
+        local v = sc[j]
+        if v > bs then bi = j; bs = v end
+    end
+    if bi ~= i then
+        ml[i], ml[bi] = ml[bi], ml[i]
+        sc[i], sc[bi] = sc[bi], sc[i]
+    end
+    return ml[i]
+end
+
+local function ttStore(depth, score, flag, move, ply)
+    local idx = hashKey % TTSIZE + 1
+    local old = ttKey[idx]
+    if old == hashKey then
+        if depth < ttDp[idx] and flag ~= 3 then return end
+        if move == 0 then move = ttMv[idx] end
+    elseif ttAge[idx] == ttGen and depth < ttDp[idx] then
+        return
+    end
+    if score > MATEB then score = score + ply elseif score < -MATEB then score = score - ply end
+    ttKey[idx] = hashKey; ttMv[idx] = move; ttSc[idx] = score
+    ttDp[idx] = depth; ttFl[idx] = flag; ttAge[idx] = ttGen
+end
+
+local qsearch, search
+
+qsearch = function(alpha, beta, ply)
+    nodes = nodes + 1
+    if nodes % 2048 == 0 then checkStop() end
+    if stopped then return 0 end
+    local stand = evaluate()
+    if ply >= MAXPLY or stand >= beta then return stand end
+    if stand > alpha then alpha = stand end
+    local n = genMoves(ply, true)
+    local ml, sc = moves[ply], mscore[ply]
+    for i = 1, n do
+        local m = ml[i]
+        local from = m % 128
+        local to = (m // 128) % 128
+        local fl = m // 16384
+        local vt = (fl == 2) and 1 or (board[to] % 8)
+        sc[i] = vt * 16 - board[from] % 8 + (fl >= 5 and 8000 or 0)
+    end
+    local best = stand
+    for i = 1, n do
+        local m = pick(ply, i, n)
+        local from = m % 128
+        local to = (m // 128) % 128
+        local fl = m // 16384
+        local vt = (fl == 2) and 1 or (board[to] % 8)
+        local skip = false
+        if fl < 5 then
+            if stand + cpv[vt] + 200 < alpha then
+                skip = true
+            elseif cv[board[from] % 8] > cv[vt] and pawnDefended(to) then
+                skip = true
+            end
+        end
+        if not skip and makeMove(m) then
+            local score = -qsearch(-beta, -alpha, ply + 1)
+            unmakeMove(m)
+            if stopped then return 0 end
+            if score > best then
+                best = score
+                if score > alpha then
+                    alpha = score
+                    if alpha >= beta then return score end
+                end
+            end
+        end
+    end
+    return best
+end
+
+search = function(depth, alpha, beta, ply, isPV, canNull, inCheck)
+    nodes = nodes + 1
+    if nodes % 2048 == 0 then checkStop() end
+    if stopped then return 0 end
+    if ply > 0 then
+        if halfmove >= 100 or isRepetition() then return 0 end
+        local ma = -MATE + ply
+        if ma > alpha then alpha = ma end
+        local mb = MATE - ply - 1
+        if mb < beta then beta = mb end
+        if alpha >= beta then return alpha end
+    end
+    if inCheck then depth = depth + 1 end
+    if depth <= 0 then return qsearch(alpha, beta, ply) end
+    if ply >= MAXPLY then return evaluate() end
+
+    local idx = hashKey % TTSIZE + 1
+    local ttMove = 0
+    if ttKey[idx] == hashKey then
+        ttMove = ttMv[idx]
+        if ttDp[idx] >= depth and not isPV then
+            local s = ttSc[idx]
+            if s > MATEB then s = s - ply elseif s < -MATEB then s = s + ply end
+            local f = ttFl[idx]
+            if f == 3 or (f == 1 and s >= beta) or (f == 2 and s <= alpha) then return s end
+        end
+    end
+
+    local staticEval = 0
+    if not inCheck then
+        staticEval = evaluate()
+        if not isPV and beta > -MATEB and beta < MATEB then
+            if depth <= 6 and staticEval - 90 * depth >= beta then return staticEval - 90 * depth end
+            if depth <= 2 and staticEval + 350 < alpha then
+                local q = qsearch(alpha, beta, ply)
+                if q <= alpha then return q end
+            end
+            if canNull and depth >= 3 and staticEval >= beta and npm[side + 1] > 0 then
+                local R = 3 + depth // 4
+                if staticEval - beta > 200 then R = R + 1 end
+                makeNull()
+                local s = -search(depth - 1 - R, -beta, -beta + 1, ply + 1, false, false, false)
+                unmakeNull()
+                if stopped then return 0 end
+                if s >= beta then
+                    if s > MATEB then s = beta end
+                    return s
+                end
+            end
+        end
+    end
+    if ttMove == 0 and isPV and depth >= 5 then depth = depth - 1 end
+
+    local n = genMoves(ply, false)
+    scoreMoves(ply, n, ttMove)
+    local ml = moves[ply]
+    local ql = qlist[ply]
+    local best, bestMove = -INF, 0
+    local origAlpha = alpha
+    local legal, nq = 0, 0
+    local canPrune = (not isPV) and (not inCheck)
+
+    for i = 1, n do
+        local m = pick(ply, i, n)
+        local to = (m // 128) % 128
+        local fl = m // 16384
+        local quiet = (board[to] == 0 and fl < 5 and fl ~= 2)
+        if canPrune and quiet and legal > 0 and best > -MATEB and depth <= 4 and nq >= 3 + depth * depth then
+            -- late move pruning: skip
+        elseif makeMove(m) then
+            legal = legal + 1
+            local gc = attacked(kingSq[side + 1], 1 - side)
+            if canPrune and quiet and not gc and legal > 1 and depth <= 3 and best > -MATEB
+                and staticEval + 120 * depth + 60 <= alpha then
+                unmakeMove(m)
+            else
+                local nd = depth - 1
+                local score
+                if legal == 1 then
+                    score = -search(nd, -beta, -alpha, ply + 1, isPV, true, gc)
+                else
+                    local r = 0
+                    if depth >= 3 and legal > 3 and quiet and not gc then
+                        local dd = depth > 64 and 64 or depth
+                        local mm = legal > 64 and 64 or legal
+                        r = lmr[dd][mm]
+                        if isPV then r = r - 1 end
+                        if m == killers1[ply] or m == killers2[ply] then r = r - 1 end
+                        if r < 0 then r = 0 end
+                        if r > nd - 1 then r = nd - 1 end
+                        if r < 0 then r = 0 end
+                    end
+                    score = -search(nd - r, -alpha - 1, -alpha, ply + 1, false, true, gc)
+                    if score > alpha and r > 0 then
+                        score = -search(nd, -alpha - 1, -alpha, ply + 1, false, true, gc)
+                    end
+                    if score > alpha and score < beta then
+                        score = -search(nd, -beta, -alpha, ply + 1, true, true, gc)
+                    end
+                end
+                unmakeMove(m)
+                if stopped then return 0 end
+                if score > best then
+                    best = score
+                    bestMove = m
+                    if score > alpha then
+                        alpha = score
+                        if alpha >= beta then
+                            if quiet then
+                                local bonus = depth * depth
+                                if bonus > 400 then bonus = 400 end
+                                local so = side * 16384 + 1
+                                local hi = m % 16384 + so
+                                local h = hist_[hi]
+                                hist_[hi] = h + bonus - (h * bonus) // 16384
+                                for k = 1, nq do
+                                    local qi = ql[k] % 16384 + so
+                                    local qh = hist_[qi]
+                                    hist_[qi] = qh - bonus - (qh * bonus) // 16384
+                                end
+                                if killers1[ply] ~= m then
+                                    killers2[ply] = killers1[ply]
+                                    killers1[ply] = m
+                                end
+                            end
+                            ttStore(depth, score, 1, m, ply)
+                            return score
+                        end
+                    end
+                end
+                if quiet then nq = nq + 1; ql[nq] = m end
+            end
+        end
+    end
+
+    if legal == 0 then
+        if inCheck then return -MATE + ply end
+        return 0
+    end
+    if best > origAlpha then
+        ttStore(depth, best, 3, bestMove, ply)
+    else
+        ttStore(depth, best, 2, 0, ply)
+    end
+    return best
+end
+
+local fenMap = { P = 1, N = 2, B = 3, R = 4, Q = 5, K = 6, p = 9, n = 10, b = 11, r = 12, q = 13, k = 14 }
+
+local function computeHash()
+    local h = 0
+    for i = 1, 64 do
+        local sq = sqList[i]
+        local p = board[sq]
+        if p ~= 0 then h = h + zPiece[p * 128 + sq] end
+    end
+    h = h + zCastle[castle]
+    if epSq ~= 0 then h = h + zEp[epSq] end
+    if side == 1 then h = h + zSide end
+    return h
+end
+
+local function setFen(fen)
+    for i = 1, 120 do board[i] = OFF end
+    for i = 1, 64 do board[sqList[i]] = 0 end
+    local parts = {}
+    for w in string.gmatch(fen, "%S+") do parts[#parts + 1] = w end
+    if #parts < 2 then error("Garbo Apex: bad FEN") end
+    mgScore, egScore, phase = 0, 0, 0
+    npm[1], npm[2] = 0, 0
+    kingSq[1], kingSq[2] = 0, 0
+    local row, col = 0, 0
+    local place = parts[1]
+    for i = 1, #place do
+        local ch = string.sub(place, i, i)
+        if ch == "/" then
+            row = row + 1; col = 0
+        elseif string.match(ch, "%d") then
+            col = col + tonumber(ch)
+        else
+            local p = fenMap[ch]
+            if not p or row > 7 or col > 7 then error("Garbo Apex: bad FEN") end
+            local sq = (row + 2) * 10 + col + 2
+            board[sq] = p
+            local t = p % 8
+            mgScore = mgScore + vMg[p * 128 + sq]
+            egScore = egScore + vEg[p * 128 + sq]
+            phase = phase + phW[t]
+            local c = (p > 8) and 2 or 1
+            if t == 6 then kingSq[c] = sq end
+            if t >= 2 and t <= 5 then npm[c] = npm[c] + 1 end
+            col = col + 1
+        end
+    end
+    if kingSq[1] == 0 or kingSq[2] == 0 then error("Garbo Apex: FEN needs both kings") end
+    side = (parts[2] == "b") and 1 or 0
+    castle = 0
+    local cs = parts[3] or "-"
+    if string.find(cs, "K", 1, true) then castle = castle + 1 end
+    if string.find(cs, "Q", 1, true) then castle = castle + 2 end
+    if string.find(cs, "k", 1, true) then castle = castle + 4 end
+    if string.find(cs, "q", 1, true) then castle = castle + 8 end
+    epSq = 0
+    local es = parts[4]
+    if es and es ~= "-" and #es >= 2 then
+        local f = string.byte(es, 1) - 97
+        local r = 8 - (string.byte(es, 2) - 48)
+        if f >= 0 and f <= 7 and r >= 0 and r <= 7 then epSq = (r + 2) * 10 + f + 2 end
+    end
+    halfmove = tonumber(parts[5] or "0") or 0
+    hashKey = computeHash()
+    sp = 0
+    hist[0] = hashKey
+end
+
+local function sqName(sq)
+    return string.char(97 + sq % 10 - 2) .. tostring(10 - sq // 10)
+end
+
+local function formatMove(m)
+    local from = m % 128
+    local to = (m // 128) % 128
+    local fl = m // 16384
+    local s = sqName(from) .. sqName(to)
+    if fl >= 5 then s = s .. string.sub("nbrq", fl - 4, fl - 4) end
+    return s
+end
+
+local function extractPV(first, maxLen)
+    local pv, made = {}, {}
+    if first and first ~= 0 and makeMove(first) then
+        pv[1] = formatMove(first); made[1] = first
+        for i = 2, maxLen do
+            local idx = hashKey % TTSIZE + 1
+            if ttKey[idx] ~= hashKey then break end
+            local mv = ttMv[idx]
+            if mv == 0 then break end
+            local n = genMoves(100 + i, false)
+            local found = false
+            local ml = moves[100 + i]
+            for j = 1, n do if ml[j] == mv then found = true; break end end
+            if not found or not makeMove(mv) then break end
+            pv[#pv + 1] = formatMove(mv); made[#made + 1] = mv
+        end
+        for j = #made, 1, -1 do unmakeMove(made[j]) end
+    end
+    return table.concat(pv, " ")
+end
+
+local function think(maxDepth)
+    ttGen = ttGen + 1
+    nodes = 0
+    stopped = false
+    for i = 0, 135 do killers1[i] = 0; killers2[i] = 0 end
+    for i = 1, 32768 do hist_[i] = hist_[i] // 4 end   -- age history between moves
+
+    local n = genMoves(0, false)
+    local list = {}
+    local ml = moves[0]
+    for i = 1, n do
+        local m = ml[i]
+        if makeMove(m) then unmakeMove(m); list[#list + 1] = m end
+    end
+    if #list == 0 then return nil, 0, 0, "" end
+    if #list == 1 then
+        local sc = evaluate()
+        return list[1], sc, 0, formatMove(list[1])
+    end
+    -- initial ordering from static ordering
+    scoreMoves(0, n, 0)
+    local order = {}
+    for i = 1, #list do order[i] = list[i] end
+    do
+        local sc = {}
+        for i = 1, n do sc[ml[i]] = mscore[0][i] end
+        table.sort(order, function(a, b) return (sc[a] or 0) > (sc[b] or 0) end)
+    end
+    list = order
+
+    local bestMove, bestScore, doneDepth, pvStr = list[1], 0, 0, ""
+    for depth = 1, maxDepth do
+        if depth > 1 and (os.clock() - startClock) > hardLimit * 0.45 then break end
+        local alpha, beta, delta = -INF, INF, 30
+        if depth >= 5 then alpha = bestScore - delta; beta = bestScore + delta end
+        local finished = false
+        while true do
+            local a = alpha
+            local lBest, lScore = nil, -INF
+            for i = 1, #list do
+                local m = list[i]
+                makeMove(m)
+                local gc = attacked(kingSq[side + 1], 1 - side)
+                local sc
+                if i == 1 then
+                    sc = -search(depth - 1, -beta, -a, 1, true, true, gc)
+                else
+                    sc = -search(depth - 1, -a - 1, -a, 1, false, true, gc)
+                    if sc > a and sc < beta then
+                        sc = -search(depth - 1, -beta, -a, 1, true, true, gc)
+                    end
+                end
+                unmakeMove(m)
+                if stopped then break end
+                if sc > lScore then lScore = sc; lBest = m end
+                if sc > a then a = sc end
+                if a >= beta then break end
+            end
+            if stopped then
+                if lBest and lScore > alpha then bestMove, bestScore = lBest, lScore end
+                break
+            end
+            if lScore <= alpha and alpha > -INF then
+                alpha = alpha - delta * 2
+                if alpha < -INF then alpha = -INF end
+                delta = delta * 2
+                if delta > 400 then alpha = -INF end
+            elseif lScore >= beta and beta < INF then
+                bestMove, bestScore = lBest, lScore
+                beta = beta + delta * 2
+                delta = delta * 2
+                if delta > 400 then beta = INF end
+            else
+                bestMove, bestScore = lBest, lScore
+                finished = true
+                break
+            end
+        end
+        if stopped then break end
+        if finished then
+            doneDepth = depth
+            for i = 1, #list do
+                if list[i] == bestMove then
+                    table.remove(list, i)
+                    table.insert(list, 1, bestMove)
+                    break
+                end
+            end
+            ttStore(depth, bestScore, 3, bestMove, 0)
+            if GA.Verbose then
+                print(("info depth %d score %d nodes %d pv %s"):format(depth, bestScore, nodes, extractPV(bestMove, depth)))
+            end
+            local as = bestScore < 0 and -bestScore or bestScore
+            if as > MATEB and depth >= MATE - as then break end
+        end
+    end
+    pvStr = extractPV(bestMove, 20)
+    return bestMove, bestScore, doneDepth, pvStr
+end
+
+local busy = false
+
+function API.GetBestMoveFromFEN(a1, a2, a3)
+    local fen, opts
+    if type(a1) == "string" then fen, opts = a1, a2 else fen, opts = a2, a3 end
+    if type(fen) ~= "string" then return nil, 0 end
+    local timeLimit, maxDepth, nl, slice = GA.TimeLimit, GA.MaxDepth, GA.NodeLimit, GA.Slice
+    local history
+    if type(opts) == "number" then
+        timeLimit = math.max(0.05, opts)
+    elseif type(opts) == "table" then
+        if type(opts.TimeLimit) == "number" then timeLimit = math.max(0.05, opts.TimeLimit) end
+        if type(opts.MaxDepth) == "number" then maxDepth = math.max(1, math.floor(opts.MaxDepth)) end
+        if type(opts.NodeLimit) == "number" then nl = math.max(1000, math.floor(opts.NodeLimit)) end
+        if type(opts.Slice) == "number" then slice = math.max(0.001, opts.Slice) end
+        history = opts.History
+    end
+    while busy do
+        if yieldFn then yieldFn() else break end
+    end
+    busy = true
+    local ok, mv, score, depth, pv = pcall(function()
+        local keys
+        if type(history) == "table" and #history > 0 then
+            keys = {}
+            for i = 1, #history do
+                setFen(history[i])
+                keys[i] = hashKey
+            end
+        end
+        setFen(fen)
+        if keys then
+            local k = #keys
+            for i = 1, k do hist[i - 1] = keys[i] end
+            hist[k] = hashKey
+            sp = k
+        end
+        startClock = os.clock()
+        lastYield = startClock
+        hardLimit = timeLimit
+        nodeLimit = nl
+        sliceLen = slice
+        return think(maxDepth)
+    end)
+    busy = false
+    if not ok then
+        local w = warn or print
+        w("Garbo Apex error: " .. tostring(mv))
+        return nil, 0
+    end
+    GA.LastDepth, GA.LastScore, GA.LastNodes, GA.LastPV = depth, score, nodes, pv
+    API._lastMove = mv
+    API._lastTime = os.clock() - startClock
+    if mv then return formatMove(mv), score end
+    return nil, 0
+end
+
+function API.Configure(a1, a2, a3)
+    if type(a1) == "table" then
+        local o = a1
+        if type(o.TimeLimit) == "number" then GA.TimeLimit = math.max(0.05, o.TimeLimit) end
+        if type(o.MaxDepth) == "number" then GA.MaxDepth = math.max(1, math.floor(o.MaxDepth)) end
+        if type(o.NodeLimit) == "number" then GA.NodeLimit = math.max(1000, math.floor(o.NodeLimit)) end
+        if type(o.Slice) == "number" then GA.Slice = math.max(0.001, o.Slice) end
+        if o.Verbose ~= nil then GA.Verbose = o.Verbose end
+    else
+        if type(a1) == "number" then GA.TimeLimit = math.max(0.05, a1) end
+        if type(a2) == "number" then GA.MaxDepth = math.max(1, math.floor(a2)) end
+        if type(a3) == "number" then GA.NodeLimit = math.max(1000, math.floor(a3)) end
+    end
+    return { TimeLimit = GA.TimeLimit, MaxDepth = GA.MaxDepth, NodeLimit = GA.NodeLimit, Slice = GA.Slice }
+end
+
+function API.GetStats()
+    return {
+        Name = "Garbo Apex", Version = "3.0",
+        Depth = GA.LastDepth, Score = GA.LastScore, Nodes = GA.LastNodes,
+        QNodes = 0, PV = GA.LastPV, Time = API._lastTime or 0,
+    }
+end
+
+function API.GetPV() return GA.LastPV end
+
+function API.EvaluateFEN(fen)
+    setFen(fen)
+    return evaluate()
+end
+
+function API.ClearHash()
+    for i = 1, TTSIZE do ttKey[i] = 0; ttMv[i] = 0; ttDp[i] = 0; ttAge[i] = 0 end
+    for i = 1, 32768 do hist_[i] = 0 end
+end
+
+-- internal helpers used for testing
+function API._perft(fen, depth)
+    setFen(fen)
+    local function perft(d, ply)
+        if d == 0 then return 1 end
+        local n = genMoves(ply, false)
+        local ml = moves[ply]
+        local c = 0
+        for i = 1, n do
+            local m = ml[i]
+            if makeMove(m) then
+                if hashKey ~= computeHash() then error("hash mismatch after " .. formatMove(m)) end
+                c = c + perft(d - 1, ply + 1)
+                unmakeMove(m)
+            end
+        end
+        return c
+    end
+    return perft(depth, 1)
+end
+
+_G.__GARBO_APEX_API = API
+return API
