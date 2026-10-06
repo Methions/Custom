@@ -1,0 +1,1190 @@
+local G = _G.__SUNFISH_NOVA_V1 or {}
+_G.__SUNFISH_NOVA_V1 = G
+
+local bit = bit32
+local band, bxor, rshift = bit.band, bit.bxor, bit.rshift
+local floor, abs, min, max, clock = math.floor, math.abs, math.min, math.max, os.clock
+local waitFn = (task and task.wait) or function() end
+local clamp = math.clamp or function(v, a, b) return max(a, min(b, v)) end
+
+local INF, MATE = 1000000000, 30000
+local MAX_DEPTH = 96
+local A1, H1, A8, H8 = 91, 98, 21, 28
+local N, E, S, W = -10, 1, 10, -1
+local MATE_SCORE = MATE
+
+G.TableSize = G.TableSize or 100000
+G.DefaultNodes = G.DefaultNodes or 5000000
+G.DefaultQDepth = G.DefaultQDepth or 8
+G.DefaultThink = G.DefaultThink or 2.0
+G.MaxDepth = G.MaxDepth or 64
+G.Slice = G.Slice or 0.025
+G.SearchId = G.SearchId or 0
+G.History = G.History or {}
+G.StyleName = G.StyleName or "Balanced"
+
+local STYLE = {
+    Balanced = {center = 1.00, mobility = 1.00, king = 1.00, pawns = 1.00, activity = 1.00, contempt = 0},
+    Tactical = {center = 1.15, mobility = 1.20, king = 1.10, pawns = 0.90, activity = 1.20, contempt = 8},
+    Aggressive = {center = 1.20, mobility = 1.10, king = 0.85, pawns = 0.90, activity = 1.20, contempt = 18},
+    Calm = {center = 0.90, mobility = 1.00, king = 1.15, pawns = 1.15, activity = 0.90, contempt = 0},
+    Positional = {center = 1.05, mobility = 1.15, king = 1.05, pawns = 1.25, activity = 1.00, contempt = 4},
+    Endgame = {center = 0.90, mobility = 1.15, king = 0.85, pawns = 1.45, activity = 1.10, contempt = 4},
+}
+
+local pst = {
+    P = {
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,198,198,198,198,198,198,198,198,0,
+        0,178,198,198,198,198,198,198,178,0,
+        0,178,198,198,198,198,198,198,178,0,
+        0,178,198,208,218,218,208,198,178,0,
+        0,178,198,218,238,238,218,198,178,0,
+        0,178,198,208,218,218,208,198,178,0,
+        0,178,198,198,198,198,198,198,178,0,
+        0,198,198,198,198,198,198,198,198,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0
+    },
+    B = {
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,797,824,817,808,808,817,824,797,0,
+        0,814,841,834,825,825,834,841,814,0,
+        0,818,845,838,829,829,838,845,818,0,
+        0,824,851,844,835,835,844,851,824,0,
+        0,827,854,847,838,838,847,854,827,0,
+        0,826,853,846,837,837,846,853,826,0,
+        0,817,844,837,828,828,837,844,817,0,
+        0,792,819,812,803,803,812,819,792,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0
+    },
+    N = {
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,627,762,786,798,798,786,762,627,0,
+        0,763,798,822,834,834,822,798,763,0,
+        0,817,852,876,888,888,876,852,817,0,
+        0,797,832,856,868,868,856,832,797,0,
+        0,799,834,858,870,870,858,834,799,0,
+        0,758,793,817,829,829,817,793,758,0,
+        0,739,774,798,810,810,798,774,739,0,
+        0,683,718,742,754,754,742,718,683,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0
+    },
+    R = {
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,1258,1263,1268,1272,1272,1268,1263,1258,0,
+        0,1258,1263,1268,1272,1272,1268,1263,1258,0,
+        0,1258,1263,1268,1272,1272,1268,1263,1258,0,
+        0,1258,1263,1268,1272,1272,1268,1263,1258,0,
+        0,1258,1263,1268,1272,1272,1268,1263,1258,0,
+        0,1258,1263,1268,1272,1272,1268,1263,1258,0,
+        0,1258,1263,1268,1272,1272,1268,1263,1258,0,
+        0,1258,1263,1268,1272,1272,1268,1263,1258,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0
+    },
+    Q = {
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,2529,2529,2529,2529,2529,2529,2529,2529,0,
+        0,2529,2529,2529,2529,2529,2529,2529,2529,0,
+        0,2529,2529,2529,2529,2529,2529,2529,2529,0,
+        0,2529,2529,2529,2529,2529,2529,2529,2529,0,
+        0,2529,2529,2529,2529,2529,2529,2529,2529,0,
+        0,2529,2529,2529,2529,2529,2529,2529,2529,0,
+        0,2529,2529,2529,2529,2529,2529,2529,2529,0,
+        0,2529,2529,2529,2529,2529,2529,2529,2529,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0
+    },
+    K = {
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,60098,60132,60073,60025,60025,60073,60132,60098,0,
+        0,60119,60153,60094,60046,60046,60094,60153,60119,0,
+        0,60146,60180,60121,60073,60073,60121,60180,60146,0,
+        0,60173,60207,60148,60100,60100,60148,60207,60173,0,
+        0,60196,60230,60171,60123,60123,60171,60230,60196,0,
+        0,60224,60258,60199,60151,60151,60199,60258,60224,0,
+        0,60287,60321,60262,60214,60214,60262,60321,60287,0,
+        0,60298,60332,60273,60225,60225,60273,60332,60298,0,
+        0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0
+    }
+}
+
+local dir = {
+    P = {N, 2*N, N+W, N+E},
+    N = {2*N+E, N+2*E, S+2*E, 2*S+E, 2*S+W, S+2*W, N+2*W, 2*N+W},
+    B = {N+E, S+E, S+W, N+W},
+    R = {N, E, S, W},
+    Q = {N, E, S, W, N+E, S+E, S+W, N+W},
+    K = {N, E, S, W, N+E, S+E, S+W, N+W}
+}
+
+local VALUE = {P = 198, N = 850, B = 840, R = 1268, Q = 2529, K = 60000}
+local PROMO = {Q = 5, R = 4, B = 3, N = 2}
+local PROMO_CH = { [5] = "q", [4] = "r", [3] = "b", [2] = "n" }
+local PIECE_CH = { [1] = "P", [2] = "N", [3] = "B", [4] = "R", [5] = "Q", [6] = "K" }
+local lowerMap = {P="p",N="n",B="b",R="r",Q="q",K="k"}
+local upperMap = {p="P",n="N",b="B",r="R",q="Q",k="K"}
+
+local function isValid(i)
+    if i < 0 or i >= 120 then return false end
+    local x = i % 10
+    return i >= 20 and i <= 99 and x >= 1 and x <= 8
+end
+
+local function cell(board, i)
+    if i < 0 or i >= #board then return " " end
+    return board:sub(i + 1, i + 1)
+end
+
+local function put(board, i, p)
+    return board:sub(1, i) .. p .. board:sub(i + 2)
+end
+
+local function swapcaseReverse(board)
+    local out = {}
+    local n = #board
+    for i = n, 1, -1 do
+        local c = board:sub(i, i)
+        if upperMap[c] then c = upperMap[c]
+        elseif lowerMap[c] then c = lowerMap[c] end
+        out[#out + 1] = c
+    end
+    return table.concat(out)
+end
+
+local function boolPairKey(p)
+    return (p[1] and "1" or "0") .. (p[2] and "1" or "0")
+end
+
+local function moveKey(m)
+    return tostring(m[1]) .. ":" .. tostring(m[2]) .. ":" .. tostring(m[3] or 0)
+end
+
+local function moveUci(m, flipped)
+    local a, b, promo = m[1], m[2], m[3]
+    if flipped then a, b = 119 - a, 119 - b end
+    local af = (a % 10) - 1
+    local ar = 10 - floor(a / 10)
+    local bf = (b % 10) - 1
+    local br = 10 - floor(b / 10)
+    local s = string.char(97 + af) .. tostring(ar) .. string.char(97 + bf) .. tostring(br)
+    if promo then s = s .. (PROMO_CH[promo] or "q") end
+    return s
+end
+
+local function parseSquare(s)
+    if type(s) ~= "string" or #s < 2 then return nil end
+    local f = string.byte(s, 1) - 97
+    local r = tonumber(s:sub(2, 2))
+    if f < 0 or f > 7 or not r or r < 1 or r > 8 then return nil end
+    return A1 + f + (1 - r) * 10
+end
+
+local function parseMoveUci(s)
+    if type(s) ~= "string" or #s < 4 then return nil end
+    local a, b = parseSquare(s:sub(1,2)), parseSquare(s:sub(3,4))
+    if not a or not b then return nil end
+    local p = 5
+    local pc = s:sub(5,5):lower()
+    if pc == "q" then p = 5 elseif pc == "r" then p = 4 elseif pc == "b" then p = 3 elseif pc == "n" then p = 2 else p = 0 end
+    return {a, b, p ~= 0 and p or nil}
+end
+
+local function clonePair(p)
+    return {p[1], p[2]}
+end
+
+local function attacked(board, sq, upper)
+    local pawn = upper and "P" or "p"
+    local knight = upper and "N" or "n"
+    local bishop = upper and "B" or "b"
+    local rook = upper and "R" or "r"
+    local queen = upper and "Q" or "q"
+    local king = upper and "K" or "k"
+
+    if upper then
+        if cell(board, sq + 9) == pawn or cell(board, sq + 11) == pawn then return true end
+    else
+        if cell(board, sq - 9) == pawn or cell(board, sq - 11) == pawn then return true end
+    end
+
+    local nd = dir.N
+    for i = 1, 8 do
+        if cell(board, sq + nd[i]) == knight then return true end
+    end
+
+    for i = 1, 4 do
+        local d = dir.B[i]
+        local t = sq + d
+        while isValid(t) do
+            local p = cell(board, t)
+            if p ~= "." then
+                if p == bishop or p == queen then return true end
+                break
+            end
+            t = t + d
+        end
+    end
+
+    for i = 1, 4 do
+        local d = dir.R[i]
+        local t = sq + d
+        while isValid(t) do
+            local p = cell(board, t)
+            if p ~= "." then
+                if p == rook or p == queen then return true end
+                break
+            end
+            t = t + d
+        end
+    end
+
+    for i = 1, 8 do
+        if cell(board, sq + dir.K[i]) == king then return true end
+    end
+    return false
+end
+
+local function findKing(board)
+    local i = board:find("K")
+    if not i then return nil end
+    return i - 1
+end
+
+local Position = {}
+Position.__index = Position
+
+function Position.new(board, score, wc, bc, ep, kp, half, fullmove)
+    return setmetatable({
+        board = board,
+        score = score or 0,
+        wc = wc or {false,false},
+        bc = bc or {false,false},
+        ep = ep or 0,
+        kp = kp or 0,
+        half = half or 0,
+        fullmove = fullmove or 1,
+    }, Position)
+end
+
+function Position:key()
+    local k = self._key
+    if k then return k end
+    k = self.board .. ";" .. boolPairKey(self.wc) .. ";" .. boolPairKey(self.bc) .. ";" .. tostring(self.ep) .. ";" .. tostring(self.kp)
+    self._key = k
+    return k
+end
+
+function Position:check()
+    local k = findKing(self.board)
+    return k and attacked(self.board, k, false) or false
+end
+
+function Position:rotate()
+    return Position.new(swapcaseReverse(self.board), -self.score, clonePair(self.bc), clonePair(self.wc), self.ep > 0 and 119 - self.ep or 0, self.kp > 0 and 119 - self.kp or 0, self.half, self.fullmove)
+end
+
+function Position:nullMove()
+    return Position.new(swapcaseReverse(self.board), -self.score, clonePair(self.bc), clonePair(self.wc), 0, 0, self.half + 1, self.fullmove)
+end
+
+function Position:value(m)
+    local i, j, promo = m[1], m[2], m[3]
+    local p, q = cell(self.board, i), cell(self.board, j)
+    local base = pst[p] and (pst[p][j + 1] - pst[p][i + 1]) or 0
+    if q ~= "." and q ~= " " and q ~= "\n" then
+        base = base + (pst[upperMap[q]] and pst[upperMap[q]][j + 1] or 0)
+    end
+    if promo then
+        local pn = PIECE_CH[promo] or "Q"
+        base = base + (pst[pn][j + 1] or VALUE[pn]) - (pst["P"][j + 1] or VALUE.P)
+    end
+    if p == "P" and j == self.ep and q == "." then
+        base = base + (pst.P[j + S + 1] or 0)
+    end
+    if p == "K" and abs(i - j) == 2 then
+        local rookFrom = j < i and A1 or H1
+        local rookTo = floor((i + j) / 2)
+        base = base + pst.R[rookTo + 1] - pst.R[rookFrom + 1]
+    end
+    return base
+end
+
+function Position:apply(m)
+    local i, j, promo = m[1], m[2], m[3]
+    local p, q = cell(self.board, i), cell(self.board, j)
+    if p ~= "P" and p ~= "N" and p ~= "B" and p ~= "R" and p ~= "Q" and p ~= "K" then return nil end
+    if q == "k" then return nil end
+    local board = self.board
+    local wc, bc = clonePair(self.wc), clonePair(self.bc)
+    local ep, kp = 0, 0
+    local score = self.score + self:value(m)
+
+    if i == A1 then wc[1] = false elseif i == H1 then wc[2] = false end
+    if j == A8 then bc[1] = false elseif j == H8 then bc[2] = false end
+    if p == "K" then wc[1], wc[2] = false, false end
+
+    board = put(board, i, ".")
+
+    if p == "P" and j == self.ep and q == "." then
+        local capSq = j + S
+        if cell(board, capSq) ~= "p" then return nil end
+        board = put(board, capSq, ".")
+    end
+
+    local placed = p
+    if p == "P" and j >= A8 and j <= H8 then
+        placed = PIECE_CH[promo or 5] or "Q"
+        if promo == nil then promo = 5 end
+    end
+    board = put(board, j, placed)
+
+    if p == "K" and abs(i - j) == 2 then
+        if j > i then
+            board = put(board, H1, ".")
+            board = put(board, H1 - 2, "R")
+            kp = i + E
+        else
+            board = put(board, A1, ".")
+            board = put(board, A1 + 3, "R")
+            kp = i + W
+        end
+    end
+
+    if p == "P" and j - i == 2 * N then
+        ep = i + N
+    end
+
+    local king = findKing(board)
+    if not king or attacked(board, king, false) then return nil end
+
+    local halfNext = (p == "P" or (q ~= "." and q ~= " " and q ~= "\n")) and 0 or (self.half + 1)
+    local next = Position.new(swapcaseReverse(board), -score, bc, wc, ep > 0 and 119 - ep or 0, kp > 0 and 119 - kp or 0, halfNext, self.fullmove)
+    return next
+end
+
+function Position:genMoves(capturesOnly)
+    local moves = {}
+    local board = self.board
+    local ep = self.ep
+
+    for i = A8, H1 do
+        if isValid(i) then
+            local p = cell(board, i)
+            if p >= "A" and p <= "Z" then
+                local ds = dir[p]
+                if ds then
+
+        if p == "P" then
+            local one = i + N
+            if not capturesOnly and cell(board, one) == "." then
+                if one >= A8 and one <= H8 then
+                    moves[#moves+1] = {i, one, 5}
+                    moves[#moves+1] = {i, one, 4}
+                    moves[#moves+1] = {i, one, 3}
+                    moves[#moves+1] = {i, one, 2}
+                else
+                    moves[#moves+1] = {i, one}
+                    if i >= 81 and i <= 88 and cell(board, i + 2*N) == "." then
+                        moves[#moves+1] = {i, i + 2*N}
+                    end
+                end
+            end
+            local c1, c2 = i + N + W, i + N + E
+            for _, to in ipairs({c1,c2}) do
+                local q = cell(board, to)
+                if q ~= " " and q ~= "\n" and q ~= "." and q >= "a" and q <= "z" and q ~= "k" then
+                    if to >= A8 and to <= H8 then
+                        moves[#moves+1] = {i, to, 5}
+                        moves[#moves+1] = {i, to, 4}
+                        moves[#moves+1] = {i, to, 3}
+                        moves[#moves+1] = {i, to, 2}
+                    else
+                        moves[#moves+1] = {i, to}
+                    end
+                elseif to == ep and ep ~= 0 and cell(board, to) == "." then
+                    moves[#moves+1] = {i, to}
+                end
+            end
+
+        elseif p == "N" or p == "K" then
+            for x = 1, #ds do
+                local to = i + ds[x]
+                if isValid(to) then
+                    local q = cell(board, to)
+                    local enemy = q >= "a" and q <= "z"
+                    if (q == "." and not capturesOnly) or (enemy and q ~= "k") then
+                        moves[#moves+1] = {i, to}
+                    end
+                end
+            end
+            if p == "K" and not capturesOnly and i == 95 and not self:check() then
+                if self.wc[2] and cell(board,96) == "." and cell(board,97) == "." and cell(board,98) == "R"
+                    and not attacked(board,96,false) and not attacked(board,97,false) then
+                    moves[#moves+1] = {95,97}
+                end
+                if self.wc[1] and cell(board,94) == "." and cell(board,93) == "." and cell(board,92) == "." and cell(board,91) == "R"
+                    and not attacked(board,94,false) and not attacked(board,93,false) then
+                    moves[#moves+1] = {95,93}
+                end
+            end
+
+        else
+            local stop = (p == "Q") and 8 or 4
+            for x = 1, stop do
+                local d = ds[x]
+                local to = i + d
+                while isValid(to) do
+                    local q = cell(board, to)
+                    if q == "." then
+                        if not capturesOnly then moves[#moves+1] = {i, to} end
+                    else
+                        if q >= "a" and q <= "z" and q ~= "k" then moves[#moves+1] = {i, to} end
+                        break
+                    end
+                    to = to + d
+                end
+            end
+        end
+                end
+            end
+        end
+    end
+    return moves
+end
+
+function Position:legalMoves(capturesOnly)
+    local pseudo = self:genMoves(capturesOnly)
+    local out = {}
+    for i = 1, #pseudo do
+        local next = self:apply(pseudo[i])
+        if next then out[#out+1] = pseudo[i] end
+    end
+    return out
+end
+
+function Position:staticExtras(style)
+    style = style or STYLE.Balanced
+    local board = self.board
+    local score = 0
+    local files = {0,0,0,0,0,0,0,0}
+    local pawnRanks = {}
+    local enemyPawnRanks = {}
+    local bishops, rooks, queens = 0, 0, 0
+    local enemyBishops, enemyRooks, enemyQueens = 0, 0, 0
+    local king = findKing(board)
+
+    for r = 2, 9 do
+        for f = 1, 8 do
+            local s = r * 10 + f
+            local p = cell(board, s)
+            if p == "P" then
+                files[f] = files[f] + 1
+                pawnRanks[f] = pawnRanks[f] or {}
+                pawnRanks[f][#pawnRanks[f]+1] = r
+            elseif p == "B" then bishops = bishops + 1
+            elseif p == "R" then rooks = rooks + 1
+            elseif p == "Q" then queens = queens + 1
+            elseif p == "p" then
+                enemyPawnRanks[f] = enemyPawnRanks[f] or {}
+                enemyPawnRanks[f][#enemyPawnRanks[f]+1] = r
+            elseif p == "b" then enemyBishops = enemyBishops + 1
+            elseif p == "r" then enemyRooks = enemyRooks + 1
+            elseif p == "q" then enemyQueens = enemyQueens + 1
+            end
+        end
+    end
+
+    if bishops >= 2 then score = score + 42 end
+    if enemyBishops >= 2 then score = score - 42 end
+
+    local centerSquares = {54,55,64,65}
+    for _, s in ipairs(centerSquares) do
+        local p = cell(board, s)
+        if p == "P" or p == "N" or p == "B" or p == "Q" then score = score + 12 * style.center end
+        if p == "p" or p == "n" or p == "b" or p == "q" then score = score - 12 * style.center end
+    end
+
+    for f = 1,8 do
+        if files[f] > 1 then score = score - (files[f]-1) * 12 * style.pawns end
+        local isolated = files[f] > 0 and (files[f-1] or 0) == 0 and (files[f+1] or 0) == 0
+        if isolated then score = score - 9 * style.pawns end
+        if files[f] > 0 then
+            local ranks = pawnRanks[f]
+            for _, r in ipairs(ranks) do
+                local passed = true
+                for nf = max(1, f-1), min(8, f+1) do
+                    local er = enemyPawnRanks[nf]
+                    if er then
+                        for _, x in ipairs(er) do
+                            if x < r then passed = false break end
+                        end
+                    end
+                    if not passed then break end
+                end
+                if passed then score = score + (r - 2) * 10 * style.pawns end
+            end
+        end
+    end
+
+    local mobility = 0
+    local enemyMobility = 0
+    for r = 2, 9 do
+        for f = 1, 8 do
+            local s = r * 10 + f
+            local p = cell(board, s)
+            if p == "N" or p == "B" or p == "R" or p == "Q" or p == "K" then
+                local ds = dir[p]
+                if ds then
+                    local stop = (p == "Q") and 8 or (p == "R") and 4 or (p == "B") and 4 or #ds
+                    for di = 1, stop do
+                        local t = s + ds[di]
+                        if isValid(t) then
+                            local q = cell(board, t)
+                            if q == "." then
+                                mobility = mobility + 1
+                            else
+                                if q >= "a" and q <= "z" then mobility = mobility + 1 end
+                                break
+                            end
+                        end
+                        if p == "N" or p == "K" then break end
+                    end
+                end
+            elseif p == "n" or p == "b" or p == "r" or p == "q" or p == "k" then
+                local up = upperMap[p]
+                local ds = dir[up]
+                if ds then
+                    local stop = (up == "Q") and 8 or (up == "R") and 4 or (up == "B") and 4 or #ds
+                    for di = 1, stop do
+                        local t = s + ds[di]
+                        if isValid(t) then
+                            local q = cell(board, t)
+                            if q == "." then
+                                enemyMobility = enemyMobility + 1
+                            else
+                                if q >= "A" and q <= "Z" then enemyMobility = enemyMobility + 1 end
+                                break
+                            end
+                        end
+                        if up == "N" or up == "K" then break end
+                    end
+                end
+            end
+        end
+    end
+    score = score + (mobility - enemyMobility) * 2.4 * style.mobility
+
+    local kingSafety = 0
+    if king then
+        for _, d in ipairs(dir.K) do
+            local s = king + d
+            if isValid(s) then
+                local p = cell(board, s)
+                if p == "P" then kingSafety = kingSafety + 7
+                elseif p == "." then kingSafety = kingSafety - 1 end
+            end
+        end
+        if attacked(board, king, false) then kingSafety = kingSafety - 60 end
+    end
+    score = score + kingSafety * style.king
+
+    if rooks > 0 then score = score + rooks * 3 * style.activity end
+    if queens > 0 then score = score + 1 * style.activity end
+    if enemyRooks > 0 then score = score - enemyRooks * 3 * style.activity end
+    if enemyQueens > 0 then score = score - enemyQueens * 1 * style.activity end
+
+    score = score + style.contempt
+    return floor(score)
+end
+
+function Position:evaluate(style)
+    return self.score + self:staticExtras(style)
+end
+
+local function legalMoveMap(pos)
+    local list = pos:legalMoves(false)
+    local map = {}
+    for i = 1, #list do map[moveKey(list[i])] = true end
+    return list, map
+end
+
+local TT = {data = {}, order = {}, count = 0}
+G.TT = G.TT or TT
+TT = G.TT
+
+local function ttClear()
+    TT.data = {}
+    TT.order = {}
+    TT.count = 0
+end
+
+local function ttSet(pos, value)
+    local key = pos:key()
+    local old = TT.data[key]
+    if old then
+        if value.depth >= old.depth or value.score >= value.gamma then
+            TT.data[key] = value
+        end
+        return
+    end
+    TT.data[key] = value
+    TT.count = TT.count + 1
+    TT.order[#TT.order + 1] = key
+    local maxSize = G.TableSize or 100000
+    while TT.count > maxSize do
+        local k = table.remove(TT.order, 1)
+        if k and TT.data[k] then
+            TT.data[k] = nil
+            TT.count = TT.count - 1
+        end
+    end
+end
+
+local function ttGet(pos)
+    return TT.data[pos:key()]
+end
+
+local function mvvLva(pos, m)
+    local p = cell(pos.board, m[1])
+    local q = cell(pos.board, m[2])
+    local victim = (q >= "a" and q <= "z") and (VALUE[upperMap[q]] or 0) or 0
+    local attacker = VALUE[p] or 0
+    local promotion = m[3] and (VALUE[PIECE_CH[m[3]]] or 0) or 0
+    return victim * 16 - attacker + promotion * 8
+end
+
+local Search = {}
+Search.__index = Search
+
+function Search.new(pos, options, style, previous)
+    G.SearchId = G.SearchId + 1
+    local now = clock()
+    local think = clamp(tonumber(options.ThinkTime or options.Time or G.DefaultThink) or G.DefaultThink, 0.05, 60)
+    return setmetatable({
+        pos = pos,
+        style = style,
+        start = now,
+        deadline = now + think,
+        nodeLimit = max(10000, floor(tonumber(options.NodeLimit) or G.DefaultNodes)),
+        qDepth = clamp(floor(tonumber(options.MaxQDepth) or G.DefaultQDepth), 2, 16),
+        maxDepth = clamp(floor(tonumber(options.MaxDepth) or G.MaxDepth), 1, MAX_DEPTH),
+        nodes = 0,
+        qnodes = 0,
+        lastYield = now,
+        abort = false,
+        cancel = type(options.Cancel) == "function" and options.Cancel or nil,
+        killers = {},
+        history = G.History,
+        previous = previous,
+        completedDepth = 0,
+        bestScore = 0,
+        bestMove = nil,
+        pv = {},
+    }, Search)
+end
+
+function Search:tick(qnode)
+    if qnode then self.qnodes = self.qnodes + 1 else self.nodes = self.nodes + 1 end
+    local n = qnode and self.qnodes or self.nodes
+    if n % 256 == 0 then
+        local t = clock()
+        if t >= self.deadline or self.nodes + self.qnodes >= self.nodeLimit or (self.cancel and self.cancel()) then
+            self.abort = true
+            return false
+        end
+        if t - self.lastYield >= (G.Slice or 0.025) then
+            self.lastYield = t
+            waitFn()
+        end
+    end
+    return true
+end
+
+function Search:ordered(pos, moves, ttMove, ply, capturesOnly)
+    local killers = self.killers[ply]
+    local scored = {}
+    for i = 1, #moves do
+        local m = moves[i]
+        local key = moveKey(m)
+        local s = pos:value(m)
+        if ttMove and moveKey(ttMove) == key then s = s + 2000000 end
+        s = s + mvvLva(pos, m) * 32
+        if m[3] then s = s + 100000 end
+        if killers and killers[1] and moveKey(killers[1]) == key then s = s + 8000 end
+        if killers and killers[2] and moveKey(killers[2]) == key then s = s + 7000 end
+        s = s + (self.history[key] or 0)
+        scored[#scored+1] = {m=m,s=s}
+    end
+    table.sort(scored, function(a,b) return a.s > b.s end)
+    local out = {}
+    for i = 1, #scored do out[i] = scored[i].m end
+    return out
+end
+
+function Search:addHistory(m, depth, good)
+    if not m then return end
+    local k = moveKey(m)
+    local bonus = good and depth * depth * 10 or -depth * 2
+    local v = (self.history[k] or 0) + bonus
+    self.history[k] = clamp(v, -50000, 50000)
+end
+
+function Search:quiesce(pos, gamma, qdepth, ply)
+    if not self:tick(true) then return 0 end
+    local checked = pos:check()
+    local stand = pos:evaluate(self.style)
+    if not checked and stand >= gamma then return stand end
+    if qdepth <= 0 and not checked then return stand end
+
+    local moves = pos:legalMoves(checked and false or true)
+    if #moves == 0 then
+        if checked then return -MATE + ply end
+        return stand
+    end
+
+    local ent = ttGet(pos)
+    local ordered = self:ordered(pos, moves, ent and ent.move or nil, ply, not checked)
+    local best = checked and -INF or stand
+    for i = 1, #ordered do
+        local m = ordered[i]
+        local child = pos:apply(m)
+        if child then
+            local score = -self:quiesce(child, 1 - gamma, qdepth - 1, ply + 1)
+            if self.abort then return best end
+            if score > best then best = score end
+            if score >= gamma then return score end
+        end
+    end
+    return best
+end
+
+function Search:bound(pos, gamma, depth, ply, allowNull)
+    if not self:tick(false) then return 0 end
+
+    local entry = ttGet(pos)
+    if entry and entry.depth >= depth then
+        local compatible = (entry.score < entry.gamma and entry.score < gamma) or (entry.score >= entry.gamma and entry.score >= gamma)
+        if compatible then return entry.score end
+    end
+
+    local checked = pos:check()
+    if depth <= 0 then
+        return self:quiesce(pos, gamma, self.qDepth, ply)
+    end
+    if checked then depth = depth + 1 end
+
+    if allowNull and not checked and depth >= 3 and pos.half > 0 then
+        local nullScore = -self:bound(pos:nullMove(), 1 - gamma, depth - 3, ply + 1, false)
+        if self.abort then return 0 end
+        if nullScore >= gamma then return nullScore end
+    end
+
+    local best = -3 * MATE
+    local bestMove = nil
+    local legal = 0
+    local moves = pos:legalMoves(false)
+    local ordered = self:ordered(pos, moves, entry and entry.move or nil, ply, false)
+
+    for i = 1, #ordered do
+        local m = ordered[i]
+        local child = pos:apply(m)
+        if child then
+            legal = legal + 1
+            local reduction = 0
+            local p = cell(pos.board, m[1])
+            local quiet = cell(pos.board, m[2]) == "." and not m[3]
+            if depth >= 5 and i >= 6 and quiet and not checked and p ~= "P" and p ~= "K" then
+                reduction = (i >= 14 and depth >= 7) and 2 or 1
+            end
+
+            local score = -self:bound(child, 1 - gamma, depth - 1 - reduction, ply + 1, true)
+            if reduction > 0 and score >= gamma and not self.abort then
+                score = -self:bound(child, 1 - gamma, depth - 1, ply + 1, true)
+            end
+            if self.abort then return 0 end
+
+            if score > best then
+                best = score
+                bestMove = m
+            end
+            if score >= gamma then
+                self:addHistory(m, depth, true)
+                if quiet then
+                    local kk = self.killers[ply] or {}
+                    self.killers[ply] = kk
+                    if not kk[1] or moveKey(kk[1]) ~= moveKey(m) then
+                        kk[2] = kk[1]
+                        kk[1] = m
+                    end
+                end
+                break
+            else
+                self:addHistory(m, depth, false)
+            end
+        end
+    end
+
+    if legal == 0 then
+        best = checked and (-MATE + ply) or 0
+        bestMove = nil
+    end
+
+    local bnd = (best >= gamma) and 2 or 1
+    if entry and best > entry.score and best >= gamma then bnd = 2 end
+    if not self.abort then
+        ttSet(pos, {depth = depth, score = best, gamma = gamma, move = bestMove, bound = bnd})
+    end
+    return best
+end
+
+function Search:searchDepth(pos, depth, guess)
+    local lower, upper = -3 * MATE, 3 * MATE
+    local score = guess or 0
+    local bestMove
+    local guard = 0
+    while lower < upper - 2 do
+        guard = guard + 1
+        if guard > 64 then break end
+        local gamma
+        if score == lower then gamma = score + 1 else gamma = score end
+        local s = self:bound(pos, gamma, depth, 0, false)
+        if self.abort then return nil, score, false end
+        score = s
+        local ent = ttGet(pos)
+        if ent then bestMove = ent.move end
+        if s < gamma then upper = s else lower = s end
+    end
+    local ent = ttGet(pos)
+    if ent then bestMove = ent.move end
+    return bestMove, score, true
+end
+
+function Search:run()
+    local depth = 1
+    local guess = 0
+    local bestMove = nil
+    local bestScore = 0
+    while depth <= self.maxDepth do
+        local m, score, complete = self:searchDepth(self.pos, depth, guess)
+        if not complete then break end
+        if m then
+            bestMove = m
+            bestScore = score
+            self.bestMove = m
+            self.bestScore = score
+            self.completedDepth = depth
+        end
+        guess = score
+        depth = depth + 1
+        if score > MATE - 1000 or score < -MATE + 1000 then break end
+        local elapsed = clock() - self.start
+        if elapsed >= (self.deadline - self.start) then break end
+        waitFn()
+    end
+    if not bestMove then
+        local moves = self.pos:legalMoves(false)
+        bestMove = moves[1]
+        bestScore = bestMove and self.pos:evaluate(self.style) or (self.pos:check() and -MATE or 0)
+    end
+    self.bestMove, self.bestScore = bestMove, bestScore
+    return bestMove, bestScore, self.completedDepth
+end
+
+local function buildBoard(placement)
+    local rows = {}
+    for row in placement:gmatch("[^/]+") do rows[#rows+1] = row end
+    while #rows < 8 do rows[#rows+1] = "8" end
+    local out = {"         \n","         \n"}
+    for r = 1, 8 do
+        local row = rows[r] or "8"
+        local line = {" "}
+        for ch in row:gmatch(".") do
+            local n = tonumber(ch)
+            if n then
+                for _ = 1, n do line[#line+1] = "." end
+            else
+                line[#line+1] = ch
+            end
+        end
+        while #line < 9 do line[#line+1] = "." end
+        line[#line+1] = "\n"
+        out[#out+1] = table.concat(line)
+    end
+    out[#out+1] = "         \n"
+    out[#out+1] = "          "
+    return table.concat(out)
+end
+
+local function parseFEN(fen)
+    if type(fen) ~= "string" or fen == "" then return nil end
+    local f = {}
+    for x in fen:gmatch("%S+") do f[#f+1] = x end
+    local placement = f[1] or "8/8/8/8/8/8/8/8"
+    local side = f[2] or "w"
+    local castle = f[3] or "-"
+    local epText = f[4] or "-"
+    local half = tonumber(f[5] or "0") or 0
+    local full = tonumber(f[6] or "1") or 1
+    local board = buildBoard(placement)
+    local ep = parseSquare(epText)
+    local wkQ = castle:find("Q",1,true) ~= nil
+    local wkK = castle:find("K",1,true) ~= nil
+    local bkQ = castle:find("q",1,true) ~= nil
+    local bkK = castle:find("k",1,true) ~= nil
+
+    local score = 0
+    for r = 2, 9 do
+        for file = 1, 8 do
+            local s = r * 10 + file
+            local p = cell(board, s)
+            if p >= "A" and p <= "Z" then
+                score = score + (pst[p] and pst[p][s + 1] or 0)
+            elseif p >= "a" and p <= "z" then
+                local up = upperMap[p]
+                score = score - (pst[up] and pst[up][119 - s + 1] or 0)
+            end
+        end
+    end
+
+    if side == "b" then
+        board = swapcaseReverse(board)
+        local nEp = ep and (119 - ep) or 0
+        return Position.new(board, -score, {bkQ,bkK}, {wkQ,wkK}, nEp, 0, half, full)
+    end
+    return Position.new(board, score, {wkQ,wkK}, {bkQ,bkK}, ep or 0, 0, half, full)
+end
+
+local function getPV(fen, maxPly, style, flipped)
+    local pos = parseFEN(fen)
+    if not pos then return "" end
+    local out = {}
+    local seen = {}
+    for _ = 1, clamp(floor(tonumber(maxPly) or 12), 1, 32) do
+        local entry = ttGet(pos)
+        if not entry or not entry.move then break end
+        local key = pos:key() .. ":" .. moveKey(entry.move)
+        if seen[key] then break end
+        seen[key] = true
+        local legal = false
+        local moves = pos:legalMoves(false)
+        for i = 1, #moves do
+            if moveKey(moves[i]) == moveKey(entry.move) then legal = true break end
+        end
+        if not legal then break end
+        out[#out+1] = moveUci(entry.move, flipped)
+        local child = pos:apply(entry.move)
+        if not child then break end
+        pos = child
+    end
+    return table.concat(out, " ")
+end
+
+local BOOK_LINES = {
+    "e2e4 e7e5 g1f3 b8c6 f1b5 a7a6 b5a4 g8f6 e1g1 f8e7",
+    "e2e4 c7c5 g1f3 d7d6 d2d4 c5d4 f3d4 g8f6 b1c3",
+    "d2d4 d7d5 c2c4 e7e6 b1c3 g8f6 c1g5 f8e7 e2e3",
+    "d2d4 g8f6 c2c4 e7e6 b1c3 f8b4 e2e3 e8g8",
+    "c2c4 e7e5 b1c3 g8f6 g2g3 d7d5 c4d5 f6d5",
+    "g1f3 d7d5 g2g3 g8f6 f1g2 e7e6 e1g1 f8e7",
+}
+
+local function buildBook()
+    local book = {}
+    for _, line in ipairs(BOOK_LINES) do
+        local pos = parseFEN("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+        local ply = 0
+        for token in line:gmatch("%S+") do
+            local parsed = parseMoveUci(token)
+            if parsed and ply % 2 == 1 then parsed[1], parsed[2] = 119 - parsed[1], 119 - parsed[2] end
+            local moves = pos:legalMoves(false)
+            local found
+            for i = 1, #moves do
+                if moveKey(moves[i]) == moveKey(parsed) then found = moves[i] break end
+            end
+            if not found then break end
+            local key = pos:key()
+            book[key] = book[key] or {}
+            book[key][moveKey(found)] = (book[key][moveKey(found)] or 0) + 1
+            pos = pos:apply(found)
+            if not pos then break end
+            ply = ply + 1
+        end
+    end
+    return book
+end
+
+G.Book = G.Book or buildBook()
+
+local Engine = {
+    Name = "Sunfish Nova",
+    Version = "1.0-Sunfish",
+    Style = G.StyleName,
+}
+
+function Engine:SetStyle(style)
+    style = tostring(style or "Balanced")
+    if not STYLE[style] then style = "Balanced" end
+    self.Style = style
+    G.StyleName = style
+    return style
+end
+
+function Engine:Configure(options)
+    if type(options) ~= "table" then return end
+    if options.TableSize then G.TableSize = clamp(floor(tonumber(options.TableSize) or 100000), 10000, 500000) end
+    if options.NodeLimit then G.DefaultNodes = max(10000, floor(tonumber(options.NodeLimit) or G.DefaultNodes)) end
+    if options.MaxQDepth then G.DefaultQDepth = clamp(floor(tonumber(options.MaxQDepth) or G.DefaultQDepth), 2, 16) end
+    if options.ThinkTime then G.DefaultThink = clamp(tonumber(options.ThinkTime) or G.DefaultThink, 0.05, 60) end
+    if options.MaxDepth then G.MaxDepth = clamp(floor(tonumber(options.MaxDepth) or G.MaxDepth), 1, MAX_DEPTH) end
+    if options.SliceTime then G.Slice = clamp(tonumber(options.SliceTime) or G.Slice, 0.005, 0.2) end
+    if options.Style then self:SetStyle(options.Style) end
+end
+
+function Engine:GetStats()
+    return G.LastStats or {}
+end
+
+function Engine:ClearCache()
+    ttClear()
+    G.History = {}
+end
+
+function Engine:Perft(fen, depth)
+    local pos = parseFEN(fen or "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+    local function walk(p, d)
+        if d == 0 then return 1 end
+        local total = 0
+        local moves = p:legalMoves(false)
+        for i = 1, #moves do
+            local child = p:apply(moves[i])
+            if child then total = total + walk(child, d - 1) end
+        end
+        return total
+    end
+    return walk(pos, max(0, floor(tonumber(depth) or 3)))
+end
+
+function Engine:IsLegalMove(fen, uci)
+    local pos = parseFEN(fen)
+    local parsed = parseMoveUci(uci)
+    if not pos or not parsed then return false end
+    local flipped = (fen:match("%S+%s+(%S+)") or "w") == "b"
+    if flipped then parsed[1], parsed[2] = 119 - parsed[1], 119 - parsed[2] end
+    local moves = pos:legalMoves(false)
+    for i = 1, #moves do
+        if moveKey(moves[i]) == moveKey(parsed) then return true end
+    end
+    return false
+end
+
+function Engine:GetPV(fen, maxPly)
+    local side = (fen:match("%S+%s+(%S+)") or "w")
+    return getPV(fen, maxPly, STYLE[self.Style] or STYLE.Balanced, side == "b")
+end
+
+function Engine:GetBestMoveFromFEN(fen, thinkTime, options)
+    if type(fen) ~= "string" or fen == "" then return nil end
+    options = type(options) == "table" and options or {}
+    if thinkTime ~= nil then options.ThinkTime = thinkTime end
+
+    local pos = parseFEN(fen)
+    if not pos then return nil end
+    local side = (fen:match("%S+%s+(%S+)") or "w")
+    local flipped = side == "b"
+    local style = STYLE[self.Style] or STYLE.Balanced
+
+    local legal = pos:legalMoves(false)
+    if #legal == 0 then
+        local score = pos:check() and -MATE or 0
+        G.LastStats = {Name=self.Name, Version=self.Version, Depth=0, Nodes=0, QNodes=0, Time=0, NPS=0, Score=score, Move=nil, PV="", Terminal=true}
+        return nil, score, nil
+    end
+
+    if options.UseBook ~= false and pos.half < 30 and G.Book then
+        local bookEntry = G.Book[pos:key()]
+        if bookEntry then
+            local best, bestW = nil, -1
+            for i = 1, #legal do
+                local w = bookEntry[moveKey(legal[i])] or 0
+                if w > bestW then best, bestW = legal[i], w end
+            end
+            if best then
+                local out = moveUci(best, flipped)
+                G.LastStats = {Name=self.Name, Version=self.Version, Depth=0, Nodes=0, QNodes=0, Time=0, NPS=0, Score=0, Move=out, PV=out, Book=true}
+                return out, 0, {notify=false, tag="BOOK", message="Sunfish opening book move.", icon="book-open"}
+            end
+        end
+    end
+
+    if #legal == 1 then
+        local out = moveUci(legal[1], flipped)
+        local score = pos:evaluate(style)
+        G.LastStats = {Name=self.Name, Version=self.Version, Depth=0, Nodes=0, QNodes=0, Time=0, NPS=0, Score=score, Move=out, PV=out}
+        return out, score, nil
+    end
+
+    for k, v in pairs(G.History) do
+        G.History[k] = floor(v * 0.80)
+        if G.History[k] == 0 then G.History[k] = nil end
+    end
+
+    local searcher = Search.new(pos, options, style, nil)
+    local bestMove, score, depth = searcher:run()
+    local elapsed = max(clock() - searcher.start, 0.001)
+    local outMove = bestMove and moveUci(bestMove, flipped) or nil
+    local pv = self:GetPV(fen, min(16, max(1, depth)))
+
+    local reaction
+    if score >= MATE - 2000 then
+        reaction = {notify=true, tag="MATE", message="A forcing mating line was found.", icon="swords"}
+    elseif score <= -MATE + 2000 then
+        reaction = {notify=true, tag="DANGER", message="The position contains a serious tactical threat.", icon="triangle-alert"}
+    elseif depth >= 8 then
+        reaction = {notify=false, tag="DEEP", message="Sunfish search reached a deep completed iteration.", icon="scan-search"}
+    end
+
+    G.LastStats = {
+        Name = self.Name,
+        Version = self.Version,
+        Depth = depth,
+        Nodes = searcher.nodes,
+        QNodes = searcher.qnodes,
+        Time = elapsed,
+        NPS = floor((searcher.nodes + searcher.qnodes) / elapsed),
+        Score = score,
+        Move = outMove,
+        PV = pv,
+        Style = self.Style,
+        TableEntries = TT.count,
+        SearchId = G.SearchId,
+    }
+
+    return outMove, score, reaction
+end
+
+function Engine:Analyze(fen, thinkTime, options)
+    local move, score, reaction = self:GetBestMoveFromFEN(fen, thinkTime, options)
+    return {Move=move, Score=score, Reaction=reaction, Stats=G.LastStats or {}}
+end
+
+function Engine:EvaluateFEN(fen)
+    local pos = parseFEN(fen)
+    if not pos then return nil end
+    return pos:evaluate(STYLE[self.Style] or STYLE.Balaanced)
+end
+
+Engine:SetStyle(G.StyleName)
+_G.__SUNFISH_NOVA_API = Engine
+
+return Engine
