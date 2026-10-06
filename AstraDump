@@ -1,0 +1,1097 @@
+local Engine = {}
+local bit = bit32
+local band, bor, bxor, rshift, lshift = bit.band, bit.bor, bit.bxor, bit.rshift, bit.lshift
+local abs, floor, min, max = math.abs, math.floor, math.min, math.max
+local clock = os.clock
+local yield = (task and task.wait) or function() end
+
+local WHITE, BLACK = 1, -1
+local EMPTY, PAWN, KNIGHT, BISHOP, ROOK, QUEEN, KING = 0, 1, 2, 3, 4, 5, 6
+local INF, MATE = 1000000000, 900000
+local MAX_PLY = 64
+local CAPTURE, EP, CASTLE, DOUBLE = 1, 2, 4, 8
+local START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+local KNIGHT = {31, 33, 14, -14, -31, -33, 18, -18}
+local BISHOP = {15, 17, -15, -17}
+local ROOK = {1, -1, 16, -16}
+local KING = {1, -1, 16, -16, 15, 17, -15, -17}
+local PROMOS = {QUEEN, ROOK, BISHOP, KNIGHT}
+local VALUES = {[PAWN] = 100, [KNIGHT] = 330, [BISHOP] = 335, [ROOK] = 500, [QUEEN] = 950, [KING] = 20000}
+local PIECE_LETTER = {[PAWN] = "p", [KNIGHT] = "n", [BISHOP] = "b", [ROOK] = "r", [QUEEN] = "q", [KING] = "k"}
+local PROMO_CHAR = {[KNIGHT] = "n", [BISHOP] = "b", [ROOK] = "r", [QUEEN] = "q"}
+
+local pst = {
+    [PAWN] = {
+        0,0,0,0,0,0,0,0,
+        8,10,10,-4,-4,10,10,8,
+        4,4,8,18,18,8,4,4,
+        2,2,7,18,18,7,2,2,
+        0,0,0,14,14,0,0,0,
+        3,-2,-5,0,0,-5,-2,3,
+        4,7,7,-12,-12,7,7,4,
+        0,0,0,0,0,0,0,0
+    },
+    [KNIGHT] = {
+        -45,-35,-25,-20,-20,-25,-35,-45,
+        -35,-12,0,5,5,0,-12,-35,
+        -25,0,12,18,18,12,0,-25,
+        -20,5,18,25,25,18,5,-20,
+        -20,0,18,25,25,18,0,-20,
+        -25,5,12,18,18,12,5,-25,
+        -35,-12,0,5,5,0,-12,-35,
+        -45,-35,-25,-20,-20,-25,-35,-45
+    },
+    [BISHOP] = {
+        -24,-12,-10,-8,-8,-10,-12,-24,
+        -12,2,4,8,8,4,2,-12,
+        -10,4,8,12,12,8,4,-10,
+        -8,8,12,16,16,12,8,-8,
+        -8,4,12,16,16,12,4,-8,
+        -10,10,10,10,10,10,10,-10,
+        -12,2,0,0,0,0,2,-12,
+        -24,-12,-10,-8,-8,-10,-12,-24
+    },
+    [ROOK] = {
+        0,0,0,5,5,0,0,0,
+        -4,0,0,0,0,0,0,-4,
+        -4,0,0,0,0,0,0,-4,
+        -4,0,0,0,0,0,0,-4,
+        -4,0,0,0,0,0,0,-4,
+        -4,0,0,0,0,0,0,-4,
+        6,10,10,12,12,10,10,6,
+        0,0,0,5,5,0,0,0
+    },
+    [QUEEN] = {
+        -18,-8,-6,-3,-3,-6,-8,-18,
+        -8,0,3,3,3,3,0,-8,
+        -6,3,6,7,7,6,3,-6,
+        -3,3,7,8,8,7,3,-3,
+        -3,3,7,8,8,7,3,-3,
+        -6,3,6,7,7,6,3,-6,
+        -8,0,3,3,3,3,0,-8,
+        -18,-8,-6,-3,-3,-6,-8,-18
+    },
+    [KING] = {
+        22,28,10,-8,-8,10,28,22,
+        18,18,0,-10,-10,0,18,18,
+        8,8,-8,-18,-18,-8,8,8,
+        0,0,-14,-25,-25,-14,0,0,
+        -8,-8,-18,-30,-30,-18,-8,-8,
+        -14,-14,-24,-34,-34,-24,-14,-14,
+        -18,-12,-10,-18,-18,-10,-12,-18,
+        -22,-16,-10,0,0,-10,-16,-22
+    }
+}
+
+local S = _G.__ASTRA_FORGE_ENGINE_STATE or {}
+_G.__ASTRA_FORGE_ENGINE_STATE = S
+S.seed = S.seed or 0xA37F19D1
+S.Z = S.Z or {}
+S.ZCastle = S.ZCastle or {}
+S.ZEp = S.ZEp or {}
+S.ZSide = S.ZSide or nil
+S.TTKey = S.TTKey or {}
+S.TTDepth = S.TTDepth or {}
+S.TTFlag = S.TTFlag or {}
+S.TTScore = S.TTScore or {}
+S.TTMove = S.TTMove or {}
+S.TTGen = S.TTGen or {}
+S.TTSize = S.TTSize or 65536
+S.TTMask = S.TTSize - 1
+S.history = S.history or {}
+S.k1 = S.k1 or {}
+S.k2 = S.k2 or {}
+S.book = S.book or {}
+S.initialized = S.initialized or false
+
+local function rand32()
+    local x = S.seed
+    x = bxor(x, lshift(x, 13))
+    x = bxor(x, rshift(x, 17))
+    x = bxor(x, lshift(x, 5))
+    S.seed = x
+    return x
+end
+
+local function pindex(p)
+    if p > 0 then return p end
+    return 6 - p
+end
+
+if not S.initialized then
+    for p = 1, 12 do
+        S.Z[p] = {}
+        for sq = 0, 127 do
+            S.Z[p][sq] = rand32()
+        end
+    end
+    for i = 0, 15 do S.ZCastle[i] = rand32() end
+    for sq = 0, 127 do S.ZEp[sq] = rand32() end
+    S.ZSide = rand32()
+    S.initialized = true
+end
+
+local function enc(from, to, promo, flags)
+    return from + to * 128 + promo * 16384 + flags * 131072
+end
+
+local function fromOf(m) return band(m, 127) end
+local function toOf(m) return band(rshift(m, 7), 127) end
+local function promoOf(m) return band(rshift(m, 14), 7) end
+local function flagsOf(m) return band(rshift(m, 17), 15) end
+
+local function sqName(sq)
+    return string.char(97 + band(sq, 15)) .. tostring(rshift(sq, 4) + 1)
+end
+
+local function moveToString(m)
+    return sqName(fromOf(m)) .. sqName(toOf(m)) .. (PROMO_CHAR[promoOf(m)] or "")
+end
+
+local function valueAt(p, sq)
+    if p == 0 then return 0 end
+    local t = p > 0 and p or -p
+    local rank = rshift(sq, 4)
+    local file = band(sq, 15)
+    local idx = (p > 0 and rank or 7 - rank) * 8 + file + 1
+    local v = VALUES[t] + (pst[t] and pst[t][idx] or 0)
+    return p > 0 and v or -v
+end
+
+local function isOn(sq)
+    return sq >= 0 and sq < 128 and band(sq, 8) == 0
+end
+
+local function resetArrays()
+    S.board = {}
+    for i = 0, 127 do S.board[i] = 0 end
+    S.side = WHITE
+    S.castle = 0
+    S.ep = -1
+    S.half = 0
+    S.full = 1
+    S.kingW = 4
+    S.kingB = 116
+    S.eval = 0
+    S.hash = 0
+    S.stack = {}
+    S.rep = {}
+    S.ply = 0
+end
+
+local function hashPiece(p, sq)
+    S.hash = bxor(S.hash, S.Z[pindex(p)][sq])
+end
+
+local function setCastle(v)
+    S.hash = bxor(S.hash, S.ZCastle[S.castle], S.ZCastle[v])
+    S.castle = v
+end
+
+local function setEp(v)
+    if S.ep >= 0 then S.hash = bxor(S.hash, S.ZEp[S.ep]) end
+    S.ep = v
+    if v >= 0 then S.hash = bxor(S.hash, S.ZEp[v]) end
+end
+
+local function setSide(v)
+    if S.side ~= v then
+        S.side = v
+        S.hash = bxor(S.hash, S.ZSide)
+    end
+end
+
+local function addPiece(p, sq)
+    S.board[sq] = p
+    hashPiece(p, sq)
+    S.eval = S.eval + valueAt(p, sq)
+end
+
+local function removePiece(sq)
+    local p = S.board[sq]
+    if p ~= 0 then
+        hashPiece(p, sq)
+        S.eval = S.eval - valueAt(p, sq)
+        S.board[sq] = 0
+    end
+    return p
+end
+
+local function parseFEN(fen)
+    resetArrays()
+    local parts = {}
+    for x in tostring(fen):gmatch("[^%s]+") do parts[#parts + 1] = x end
+    local boardPart = parts[1] or "8/8/8/8/8/8/8/8"
+    local sidePart = parts[2] or "w"
+    local castlePart = parts[3] or "-"
+    local epPart = parts[4] or "-"
+    S.half = tonumber(parts[5]) or 0
+    S.full = tonumber(parts[6]) or 1
+    local rank = 7
+    for row in boardPart:gmatch("[^/]+") do
+        local file = 0
+        for i = 1, #row do
+            local c = row:sub(i, i)
+            local n = tonumber(c)
+            if n then
+                file = file + n
+            else
+                local white = c == c:upper()
+                local l = c:lower()
+                local pt = l == "p" and PAWN or l == "n" and KNIGHT or l == "b" and BISHOP or l == "r" and ROOK or l == "q" and QUEEN or KING
+                local sq = rank * 16 + file
+                local p = white and pt or -pt
+                addPiece(p, sq)
+                if pt == KING then
+                    if white then S.kingW = sq else S.kingB = sq end
+                end
+                file = file + 1
+            end
+        end
+        rank = rank - 1
+    end
+    if sidePart == "b" then
+        S.side = BLACK
+        S.hash = bxor(S.hash, S.ZSide)
+    end
+    if castlePart:find("K", 1, true) then S.castle = S.castle + 1 end
+    if castlePart:find("Q", 1, true) then S.castle = S.castle + 2 end
+    if castlePart:find("k", 1, true) then S.castle = S.castle + 4 end
+    if castlePart:find("q", 1, true) then S.castle = S.castle + 8 end
+    S.hash = bxor(S.hash, S.ZCastle[S.castle])
+    if epPart ~= "-" and #epPart >= 2 then
+        local f = string.byte(epPart, 1) - 97
+        local r = tonumber(epPart:sub(2, 2))
+        if f >= 0 and f < 8 and r and r >= 1 and r <= 8 then
+            S.ep = (r - 1) * 16 + f
+            S.hash = bxor(S.hash, S.ZEp[S.ep])
+        end
+    end
+    S.rep[1] = S.hash
+    return true
+end
+
+local function attacked(sq, by)
+    local B = S.board
+    if by == WHITE then
+        local a = sq - 15
+        if isOn(a) and B[a] == PAWN then return true end
+        a = sq - 17
+        if isOn(a) and B[a] == PAWN then return true end
+    else
+        local a = sq + 15
+        if isOn(a) and B[a] == -PAWN then return true end
+        a = sq + 17
+        if isOn(a) and B[a] == -PAWN then return true end
+    end
+    local nk = by * KNIGHT
+    for i = 1, 8 do
+        local t = sq + KNIGHT[i]
+        if isOn(t) and B[t] == nk then return true end
+    end
+    local bs, qs = by * BISHOP, by * QUEEN
+    for i = 1, 4 do
+        local d = BISHOP[i]
+        local t = sq + d
+        while isOn(t) do
+            local p = B[t]
+            if p ~= 0 then
+                if p == bs or p == qs then return true end
+                break
+            end
+            t = t + d
+        end
+    end
+    local rs = by * ROOK
+    for i = 1, 4 do
+        local d = ROOK[i]
+        local t = sq + d
+        while isOn(t) do
+            local p = B[t]
+            if p ~= 0 then
+                if p == rs or p == qs then return true end
+                break
+            end
+            t = t + d
+        end
+    end
+    local ks = by * KING
+    for i = 1, 8 do
+        local t = sq + KING[i]
+        if isOn(t) and B[t] == ks then return true end
+    end
+    return false
+end
+
+local function inCheck(side)
+    return attacked(side == WHITE and S.kingW or S.kingB, -side)
+end
+
+local function pushMove(list, m)
+    list[#list + 1] = m
+end
+
+local function generateMoves(capsOnly)
+    local B = S.board
+    local side = S.side
+    local moves = {}
+    local enemy = -side
+    for rank = 0, 7 do
+        local base = rank * 16
+        for file = 0, 7 do
+            local from = base + file
+            local p = B[from]
+            if p * side > 0 then
+                local t = p > 0 and p or -p
+                if t == PAWN then
+                    local step = side * 16
+                    local one = from + step
+                    local toRank = rshift(one, 4)
+                    local promoRank = side == WHITE and 7 or 0
+                    if isOn(one) and B[one] == 0 and not capsOnly then
+                        if toRank == promoRank then
+                            for i = 1, 4 do pushMove(moves, enc(from, one, PROMOS[i], 0)) end
+                        else
+                            pushMove(moves, enc(from, one, 0, 0))
+                            local startRank = side == WHITE and 1 or 6
+                            local two = one + step
+                            if rank == startRank and isOn(two) and B[two] == 0 then
+                                pushMove(moves, enc(from, two, 0, DOUBLE))
+                            end
+                        end
+                    end
+                    for k = -1, 1, 2 do
+                        local to = one + k
+                        if isOn(to) then
+                            local q = B[to]
+                            if q * side < 0 or to == S.ep then
+                                local fl = q * side < 0 and CAPTURE or bor(CAPTURE, EP)
+                                if rshift(to, 4) == promoRank then
+                                    for i = 1, 4 do pushMove(moves, enc(from, to, PROMOS[i], fl)) end
+                                else
+                                    pushMove(moves, enc(from, to, 0, fl))
+                                end
+                            end
+                        end
+                    end
+                elseif t == KNIGHT then
+                    for i = 1, 8 do
+                        local to = from + KNIGHT[i]
+                        if isOn(to) then
+                            local q = B[to]
+                            if q == 0 then
+                                if not capsOnly then pushMove(moves, enc(from, to, 0, 0)) end
+                            elseif q * side < 0 then
+                                pushMove(moves, enc(from, to, 0, CAPTURE))
+                            end
+                        end
+                    end
+                elseif t == KING then
+                    for i = 1, 8 do
+                        local to = from + KING[i]
+                        if isOn(to) then
+                            local q = B[to]
+                            if q == 0 then
+                                if not capsOnly then pushMove(moves, enc(from, to, 0, 0)) end
+                            elseif q * side < 0 then
+                                pushMove(moves, enc(from, to, 0, CAPTURE))
+                            end
+                        end
+                    end
+                    if not capsOnly and not inCheck(side) then
+                        if side == WHITE and from == 4 then
+                            if band(S.castle, 1) ~= 0 and B[5] == 0 and B[6] == 0 and B[7] == ROOK and not attacked(5, BLACK) and not attacked(6, BLACK) then
+                                pushMove(moves, enc(4, 6, 0, CASTLE))
+                            end
+                            if band(S.castle, 2) ~= 0 and B[3] == 0 and B[2] == 0 and B[1] == 0 and B[0] == ROOK and not attacked(3, BLACK) and not attacked(2, BLACK) then
+                                pushMove(moves, enc(4, 2, 0, CASTLE))
+                            end
+                        elseif side == BLACK and from == 116 then
+                            if band(S.castle, 4) ~= 0 and B[117] == 0 and B[118] == 0 and B[119] == -ROOK and not attacked(117, WHITE) and not attacked(118, WHITE) then
+                                pushMove(moves, enc(116, 118, 0, CASTLE))
+                            end
+                            if band(S.castle, 8) ~= 0 and B[115] == 0 and B[114] == 0 and B[113] == 0 and B[112] == -ROOK and not attacked(115, WHITE) and not attacked(114, WHITE) then
+                                pushMove(moves, enc(116, 114, 0, CASTLE))
+                            end
+                        end
+                    end
+                else
+                    local dirs = t == BISHOP and BISHOP or t == ROOK and ROOK or KING
+                    local limit = t == QUEEN and 8 or 4
+                    for i = 1, limit do
+                        local d = dirs[i]
+                        local to = from + d
+                        while isOn(to) do
+                            local q = B[to]
+                            if q == 0 then
+                                if not capsOnly then pushMove(moves, enc(from, to, 0, 0)) end
+                            else
+                                if q * side < 0 then pushMove(moves, enc(from, to, 0, CAPTURE)) end
+                                break
+                            end
+                            to = to + d
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return moves
+end
+
+local unmakeMove
+
+local function makeMove(m, ply)
+    local from, to = fromOf(m), toOf(m)
+    local promo, flags = promoOf(m), flagsOf(m)
+    local side, B = S.side, S.board
+    local piece = B[from]
+    if piece == 0 or piece * side <= 0 then return false end
+    local u = S.stack[ply]
+    if not u then u = {}; S.stack[ply] = u end
+    u.from, u.to = from, to
+    u.piece, u.promo, u.flags = piece, promo, flags
+    u.captured = 0
+    u.capSq = to
+    u.rookFrom, u.rookTo, u.rookPiece = -1, -1, 0
+    u.castle, u.ep, u.half, u.full = S.castle, S.ep, S.half, S.full
+    u.kingW, u.kingB, u.eval, u.hash, u.side = S.kingW, S.kingB, S.eval, S.hash, S.side
+    local capSq = to
+    if band(flags, EP) ~= 0 then capSq = to - side * 16 end
+    u.capSq = capSq
+    u.captured = B[capSq]
+
+    removePiece(from)
+    if u.captured ~= 0 then removePiece(capSq) end
+    setEp(-1)
+    if band(flags, CASTLE) ~= 0 then
+        local rf, rt = -1, -1
+        if to == 6 then rf, rt = 7, 5
+        elseif to == 2 then rf, rt = 0, 3
+        elseif to == 118 then rf, rt = 119, 117
+        else rf, rt = 112, 115 end
+        local rook = B[rf]
+        if rook ~= 0 then
+            u.rookFrom, u.rookTo, u.rookPiece = rf, rt, rook
+            removePiece(rf)
+            addPiece(rook, rt)
+        end
+    end
+    local placed = piece
+    if promo ~= 0 then placed = side * promo end
+    addPiece(placed, to)
+    if piece == KING then S.kingW = to elseif piece == -KING then S.kingB = to end
+    if band(flags, DOUBLE) ~= 0 then setEp(from + side * 8) end
+    if abs(to - from) == 16 or abs(piece) == PAWN or u.captured ~= 0 then S.half = 0 else S.half = S.half + 1 end
+    S.full = S.full + (side == BLACK and 1 or 0)
+    local c = S.castle
+    if piece == KING then
+        if side == WHITE then c = band(c, 12) else c = band(c, 3) end
+    elseif piece == ROOK then
+        if from == 0 then c = band(c, 13) elseif from == 7 then c = band(c, 14) end
+    elseif piece == -ROOK then
+        if from == 112 then c = band(c, 7) elseif from == 119 then c = band(c, 11) end
+    end
+    if u.captured == ROOK then
+        if capSq == 0 then c = band(c, 13) elseif capSq == 7 then c = band(c, 14) end
+    elseif u.captured == -ROOK then
+        if capSq == 112 then c = band(c, 7) elseif capSq == 119 then c = band(c, 11) end
+    end
+    if c ~= S.castle then setCastle(c) end
+    setSide(-side)
+    S.ply = ply
+    local kingSq = side == WHITE and S.kingW or S.kingB
+    if attacked(kingSq, -side) then
+        unmakeMove(m, ply)
+        return false
+    end
+    S.rep[ply + 1] = S.hash
+    return true
+end
+
+unmakeMove = function(m, ply)
+    local u = S.stack[ply]
+    local B = S.board
+    local from, to = u.from, u.to
+    B[to] = 0
+    if u.rookFrom >= 0 then
+        B[u.rookTo] = 0
+        B[u.rookFrom] = u.rookPiece
+    end
+    B[from] = u.piece
+    if u.captured ~= 0 then B[u.capSq] = u.captured end
+    S.castle = u.castle
+    S.ep = u.ep
+    S.half = u.half
+    S.full = u.full
+    S.kingW = u.kingW
+    S.kingB = u.kingB
+    S.eval = u.eval
+    S.hash = u.hash
+    S.side = u.side
+    S.ply = ply - 1
+end
+
+local function tacticalScore(m)
+    local from, to = fromOf(m), toOf(m)
+    local victim = S.board[to]
+    local attacker = S.board[from]
+    local promo = promoOf(m)
+    local score = 0
+    if victim ~= 0 then
+        score = score + 100000 + VALUES[abs(victim)] * 16 - VALUES[abs(attacker)]
+    elseif band(flagsOf(m), EP) ~= 0 then
+        score = score + 100000 + 1400 - VALUES[PAWN]
+    end
+    if promo ~= 0 then score = score + 80000 + VALUES[promo] * 8 end
+    return score
+end
+
+local function quietScore(m, ply)
+    local from, to = fromOf(m), toOf(m)
+    local key = from * 128 + to + 1
+    local p = S.board[from]
+    local h = S.history[pindex(p)] and S.history[pindex(p)][key] or 0
+    local k1 = S.k1[ply] or 0
+    local k2 = S.k2[ply] or 0
+    local v = h
+    if m == k1 then v = v + 90000 end
+    if m == k2 then v = v + 70000 end
+    if abs(p) == KNIGHT or abs(p) == BISHOP then v = v + 4 end
+    if band(to, 15) >= 2 and band(to, 15) <= 5 and rshift(to, 4) >= 2 and rshift(to, 4) <= 5 then v = v + 25 end
+    return v
+end
+
+local function orderMoves(moves, ttMove, ply)
+    local scores = {}
+    for i = 1, #moves do
+        local m = moves[i]
+        local s
+        if m == ttMove then s = 20000000
+        elseif band(flagsOf(m), CAPTURE) ~= 0 or promoOf(m) ~= 0 then s = 5000000 + tacticalScore(m)
+        else s = quietScore(m, ply) end
+        scores[i] = s
+    end
+    for i = 1, #moves - 1 do
+        local bi, bv = i, scores[i]
+        for j = i + 1, #moves do
+            if scores[j] > bv then bi, bv = j, scores[j] end
+        end
+        if bi ~= i then
+            moves[i], moves[bi] = moves[bi], moves[i]
+            scores[i], scores[bi] = scores[bi], scores[i]
+        end
+    end
+end
+
+local function shouldStop()
+    if S.stop then return true end
+    if S.nodes + S.qnodes >= S.nodeLimit then
+        S.stop = true
+        return true
+    end
+    local total = S.nodes + S.qnodes
+    if band(total, S.timeMask) == 0 and clock() - S.start >= S.timeLimit then
+        S.stop = true
+        return true
+    end
+    return false
+end
+
+local function ttProbe(depth, alpha, beta, ply)
+    local idx = band(S.hash, S.TTMask) + 1
+    if S.TTKey[idx] == S.hash and S.TTGen[idx] == S.generation then
+        local d = S.TTDepth[idx] or -1
+        if d >= depth then
+            local score = S.TTScore[idx]
+            if score > MATE - 10000 then score = score - ply end
+            if score < -MATE + 10000 then score = score + ply end
+            local flag = S.TTFlag[idx]
+            if flag == 0 then return score, S.TTMove[idx] or 0 end
+            if flag == 1 and score <= alpha then return score, S.TTMove[idx] or 0 end
+            if flag == 2 and score >= beta then return score, S.TTMove[idx] or 0 end
+        end
+        return nil, S.TTMove[idx] or 0
+    end
+    return nil, 0
+end
+
+local function ttStore(depth, score, flag, move, ply)
+    local idx = band(S.hash, S.TTMask) + 1
+    local oldDepth = S.TTDepth[idx] or -1
+    if S.TTKey[idx] ~= S.hash or S.TTGen[idx] ~= S.generation or depth >= oldDepth then
+        local s = score
+        if s > MATE - 10000 then s = s + ply end
+        if s < -MATE + 10000 then s = s - ply end
+        S.TTKey[idx] = S.hash
+        S.TTDepth[idx] = depth
+        S.TTFlag[idx] = flag
+        S.TTScore[idx] = s
+        S.TTMove[idx] = move or 0
+        S.TTGen[idx] = S.generation
+    end
+end
+
+local function pawnInfo()
+    local B = S.board
+    local filesW, filesB = {0,0,0,0,0,0,0,0}, {0,0,0,0,0,0,0,0}
+    for r = 0, 7 do
+        for f = 0, 7 do
+            local p = B[r * 16 + f]
+            if p == PAWN then filesW[f + 1] = filesW[f + 1] + 1
+            elseif p == -PAWN then filesB[f + 1] = filesB[f + 1] + 1 end
+        end
+    end
+    local score = 0
+    for f = 1, 8 do
+        if filesW[f] > 1 then score = score - (filesW[f] - 1) * 18 end
+        if filesB[f] > 1 then score = score + (filesB[f] - 1) * 18 end
+        if filesW[f] > 0 and (filesW[max(1, f - 1)] + filesW[min(8, f + 1)] == filesW[f]) then score = score - 10 end
+        if filesB[f] > 0 and (filesB[max(1, f - 1)] + filesB[min(8, f + 1)] == filesB[f]) then score = score + 10 end
+    end
+    for r = 0, 7 do
+        for f = 0, 7 do
+            local sq = r * 16 + f
+            local p = B[sq]
+            if p == PAWN then
+                local blocked = false
+                for ff = max(0, f - 1), min(7, f + 1) do
+                    for rr = r + 1, 7 do
+                        if B[rr * 16 + ff] == -PAWN then blocked = true; break end
+                    end
+                    if blocked then break end
+                end
+                if not blocked then score = score + 12 + r * 7 end
+            elseif p == -PAWN then
+                local blocked = false
+                for ff = max(0, f - 1), min(7, f + 1) do
+                    for rr = 0, r - 1 do
+                        if B[rr * 16 + ff] == PAWN then blocked = true; break end
+                    end
+                    if blocked then break end
+                end
+                if not blocked then score = score - 12 - (7 - r) * 7 end
+            end
+        end
+    end
+    return score
+end
+
+local function attackPotential()
+    local B = S.board
+    local wk, bk = S.kingW, S.kingB
+    local wAttack, bAttack = 0, 0
+    local wPawns, bPawns = 0, 0
+    for sq = 0, 127 do
+        if isOn(sq) then
+            local p = B[sq]
+            if p ~= 0 then
+                local t = abs(p)
+                if t == PAWN then
+                    if p > 0 then wPawns = wPawns + 1 else bPawns = bPawns + 1 end
+                elseif t ~= KING then
+                    local ksq = p > 0 and bk or wk
+                    local dx = abs(band(sq, 15) - band(ksq, 15))
+                    local dy = abs(rshift(sq, 4) - rshift(ksq, 4))
+                    local d = max(dx, dy)
+                    if d <= 2 then
+                        local a = t == QUEEN and 24 or t == ROOK and 18 or t == BISHOP and 14 or t == KNIGHT and 12 or 6
+                        if p > 0 then wAttack = wAttack + a * (3 - d) else bAttack = bAttack + a * (3 - d) end
+                    end
+                end
+            end
+        end
+    end
+    local score = wAttack - bAttack
+    local shieldW, shieldB = 0, 0
+    local wkf = band(wk, 15); local wkr = rshift(wk, 4)
+    local bkf = band(bk, 15); local bkr = rshift(bk, 4)
+    for df = -1, 1 do
+        local f1 = wkf + df
+        if f1 >= 0 and f1 <= 7 then
+            for rr = max(0, wkr + 1), min(7, wkr + 2) do if B[rr * 16 + f1] == PAWN then shieldW = shieldW + 1 end end
+        end
+        local f2 = bkf + df
+        if f2 >= 0 and f2 <= 7 then
+            for rr = max(0, bkr - 2), min(7, bkr - 1) do if B[rr * 16 + f2] == -PAWN then shieldB = shieldB + 1 end end
+        end
+    end
+    score = score + (shieldW - shieldB) * 14
+    if shieldB == 0 then score = score + wAttack * 0.15 end
+    if shieldW == 0 then score = score - bAttack * 0.15 end
+    if wPawns < 5 then score = score + 4 end
+    if bPawns < 5 then score = score - 4 end
+    return score
+end
+
+local function positional()
+    local B = S.board
+    local score = 0
+    local bishopsW, bishopsB = 0, 0
+    for sq = 0, 127 do
+        if isOn(sq) then
+            local p = B[sq]
+            if p == BISHOP then bishopsW = bishopsW + 1
+            elseif p == -BISHOP then bishopsB = bishopsB + 1
+            elseif p == ROOK or p == -ROOK then
+                local f = band(sq, 15)
+                local hasPawnW, hasPawnB = false, false
+                for r = 0, 7 do
+                    local q = B[r * 16 + f]
+                    if q == PAWN then hasPawnW = true elseif q == -PAWN then hasPawnB = true end
+                end
+                if p == ROOK then
+                    if not hasPawnW and not hasPawnB then score = score + 14 elseif not hasPawnW then score = score + 7 end
+                else
+                    if not hasPawnW and not hasPawnB then score = score - 14 elseif not hasPawnB then score = score - 7 end
+                end
+            end
+        end
+    end
+    if bishopsW >= 2 then score = score + 24 end
+    if bishopsB >= 2 then score = score - 24 end
+    local center = {34, 35, 50, 51, 36, 37, 52, 53}
+    for i = 1, #center do
+        local p = B[center[i]]
+        if p == PAWN or p == KNIGHT or p == BISHOP then score = score + 5 elseif p == -PAWN or p == -KNIGHT or p == -BISHOP then score = score - 5 end
+    end
+    return score
+end
+
+local function evaluate()
+    local score = S.eval
+    score = score + pawnInfo() + positional() + attackPotential()
+    return floor(score * (S.side == WHITE and 1 or -1))
+end
+
+local function hasLegalMove()
+    local moves = generateMoves(false)
+    for i = 1, #moves do
+        if makeMove(moves[i], S.ply + 1) then
+            unmakeMove(moves[i], S.ply + 1)
+            return true
+        end
+    end
+    return false
+end
+
+local function qsearch(alpha, beta, ply, qply)
+    S.qnodes = S.qnodes + 1
+    if shouldStop() then return 0 end
+    local check = inCheck(S.side)
+    local stand = check and -INF or evaluate()
+    if stand >= beta then return stand end
+    if stand > alpha then alpha = stand end
+    if qply <= 0 and not check then return stand end
+    local moves = generateMoves(not check)
+    orderMoves(moves, 0, ply)
+    local searched = 0
+    for i = 1, #moves do
+        local m = moves[i]
+        if not check and band(flagsOf(m), CAPTURE) == 0 and promoOf(m) == 0 then break end
+        if makeMove(m, ply + 1) then
+            local score = -qsearch(-beta, -alpha, ply + 1, qply - 1)
+            unmakeMove(m, ply + 1)
+            if S.stop then return 0 end
+            if score >= beta then return score end
+            if score > alpha then alpha = score end
+            searched = searched + 1
+            if searched >= 24 and not check then break end
+        end
+    end
+    return alpha
+end
+
+local function search(depth, alpha, beta, ply, allowNull)
+    S.nodes = S.nodes + 1
+    if shouldStop() then return 0 end
+    local side = S.side
+    local check = inCheck(side)
+    if S.half >= 100 then return 0 end
+    if depth <= 0 then return qsearch(alpha, beta, ply, S.qDepth) end
+    if ply >= MAX_PLY - 2 then return evaluate() end
+    local originalAlpha = alpha
+    local ttScore, ttMove = ttProbe(depth, alpha, beta, ply)
+    if ttScore ~= nil then return ttScore end
+
+    if allowNull and not check and depth >= 4 and S.half > 0 then
+        local nonPawn = false
+        for sq = 0, 127 do
+            if isOn(sq) then
+                local p = S.board[sq]
+                if p * side > 0 and abs(p) >= KNIGHT then nonPawn = true; break end
+            end
+        end
+        if nonPawn then
+            local oldSide, oldEp, oldHash = S.side, S.ep, S.hash
+            setEp(-1)
+            setSide(-side)
+            local score = -search(depth - 3, -beta, -beta + 1, ply + 1, false)
+            S.side, S.ep, S.hash = oldSide, oldEp, oldHash
+            if S.stop then return 0 end
+            if score >= beta then return score end
+        end
+    end
+
+    local moves = generateMoves(false)
+    orderMoves(moves, ttMove, ply)
+    local best = -INF
+    local bestMove = 0
+    local legal = 0
+    for i = 1, #moves do
+        local m = moves[i]
+        local quiet = band(flagsOf(m), CAPTURE) == 0 and promoOf(m) == 0
+        if depth <= 3 and legal > 5 and quiet and not check then
+            local margin = 70 + depth * 35
+            if evaluate() + margin <= alpha then
+                continue
+            end
+        end
+        if makeMove(m, ply + 1) then
+            legal = legal + 1
+            local newDepth = depth - 1
+            if check then newDepth = newDepth end
+            local reduction = 0
+            if depth >= 4 and quiet and legal > 4 and not check then
+                reduction = legal > 10 and 2 or 1
+            end
+            local score
+            if legal == 1 then
+                score = -search(newDepth, -beta, -alpha, ply + 1, true)
+            else
+                score = -search(max(0, newDepth - reduction), -alpha - 1, -alpha, ply + 1, true)
+                if not S.stop and score > alpha then
+                    score = -search(newDepth, -beta, -alpha, ply + 1, true)
+                end
+            end
+            unmakeMove(m, ply + 1)
+            if S.stop then return 0 end
+            if score > best then best = score; bestMove = m end
+            if score > alpha then
+                alpha = score
+                if quiet then
+                    local pi = pindex(S.board[fromOf(m)])
+                    S.history[pi] = S.history[pi] or {}
+                    local hk = fromOf(m) * 128 + toOf(m) + 1
+                    S.history[pi][hk] = min(60000, (S.history[pi][hk] or 0) + depth * depth * 4)
+                end
+            end
+            if alpha >= beta then
+                if quiet then
+                    if S.k1[ply] ~= m then S.k2[ply] = S.k1[ply] or 0; S.k1[ply] = m end
+                end
+                ttStore(depth, alpha, 2, m, ply)
+                return alpha
+            end
+        end
+    end
+    if legal == 0 then
+        if check then return -MATE + ply end
+        return 0
+    end
+    local flag = best <= originalAlpha and 1 or 0
+    ttStore(depth, best, flag, bestMove, ply)
+    return best
+end
+
+local function rootSearch(depth, alpha, beta)
+    local moves = generateMoves(false)
+    local legalRoot = {}
+    for i = 1, #moves do
+        if makeMove(moves[i], 1) then
+            unmakeMove(moves[i], 1)
+            legalRoot[#legalRoot + 1] = moves[i]
+        end
+    end
+    if #legalRoot == 0 then return 0, 0, {} end
+    local _, ttMove = ttProbe(depth, alpha, beta, 0)
+    orderMoves(legalRoot, ttMove, 0)
+    local bestMove, bestScore = legalRoot[1], -INF
+    local pv = {}
+    for i = 1, #legalRoot do
+        local m = legalRoot[i]
+        if makeMove(m, 1) then
+            local score
+            if i == 1 then
+                score = -search(depth - 1, -beta, -alpha, 1, true)
+            else
+                score = -search(depth - 1, -alpha - 1, -alpha, 1, true)
+                if not S.stop and score > alpha then
+                    score = -search(depth - 1, -beta, -alpha, 1, true)
+                end
+            end
+            unmakeMove(m, 1)
+            if S.stop then break end
+            if score > bestScore then
+                bestScore = score
+                bestMove = m
+                alpha = max(alpha, score)
+            end
+            if alpha >= beta then break end
+        end
+    end
+    if bestMove ~= 0 then
+        pv[1] = moveToString(bestMove)
+        if makeMove(bestMove, 1) then
+            local made = 1
+            for d = 1, min(depth - 1, 8) do
+                local idx = band(S.hash, S.TTMask) + 1
+                local bm = S.TTKey[idx] == S.hash and S.TTGen[idx] == S.generation and S.TTMove[idx] or 0
+                if not bm or bm == 0 then break end
+                if not makeMove(bm, d + 1) then break end
+                made = d + 1
+                pv[#pv + 1] = moveToString(bm)
+            end
+            for level = made, 2, -1 do unmakeMove(0, level) end
+            unmakeMove(bestMove, 1)
+        end
+    end
+    ttStore(depth, bestScore, 0, bestMove, 0)
+    return bestScore, bestMove, pv
+end
+
+local function clearTT()
+    S.TTKey, S.TTDepth, S.TTFlag, S.TTScore, S.TTMove, S.TTGen = {}, {}, {}, {}, {}, {}
+    S.generation = 0
+end
+
+local function ensureHistory()
+    for i = 1, 12 do S.history[i] = S.history[i] or {} end
+end
+
+function Engine:Configure(opts)
+    opts = opts or {}
+    if opts.Time ~= nil or opts.ThinkTime ~= nil then self.Time = max(0.05, tonumber(opts.Time or opts.ThinkTime) or self.Time) end
+    if opts.MaxDepth ~= nil then self.MaxDepth = max(1, min(40, floor(tonumber(opts.MaxDepth) or self.MaxDepth))) end
+    if opts.NodeLimit ~= nil then self.NodeLimit = max(20000, floor(tonumber(opts.NodeLimit) or self.NodeLimit)) end
+    if opts.Aggression ~= nil then self.Aggression = tonumber(opts.Aggression) or self.Aggression end
+    if opts.TableSize ~= nil then
+        local n = 1
+        local want = max(4096, min(262144, floor(tonumber(opts.TableSize) or S.TTSize)))
+        while n < want do n = n * 2 end
+        S.TTSize, S.TTMask = n, n - 1
+        clearTT()
+    end
+    return self
+end
+
+function Engine:Reset()
+    clearTT()
+    S.history = {}
+    S.k1, S.k2 = {}, {}
+    ensureHistory()
+    parseFEN(START_FEN)
+    return self
+end
+
+function Engine:GetBestMoveFromFEN(a1, a2, a3)
+    local fen, thinkTime
+    if type(a1) == "table" then fen, thinkTime = a2, a3 else fen, thinkTime = a1, a2 end
+    if type(fen) ~= "string" then return nil end
+    ensureHistory()
+    parseFEN(fen)
+    local fallback = generateMoves(false)
+    local firstLegal = 0
+    for i = 1, #fallback do
+        if makeMove(fallback[i], 1) then unmakeMove(fallback[i], 1); firstLegal = fallback[i]; break end
+    end
+    if firstLegal == 0 then return nil end
+    local requested = tonumber(thinkTime) or self.Time
+    S.timeLimit = max(0.05, min(self.TimeMax, requested))
+    S.nodeLimit = max(20000, tonumber(self.NodeLimit) or 160000)
+    if thinkTime == nil and self.NodeLimitAuto then
+        S.nodeLimit = floor(90000 + S.timeLimit * 115000)
+    end
+    S.timeMask = S.timeLimit <= 0.15 and 511 or 1023
+    S.start = clock()
+    S.nodes, S.qnodes = 0, 0
+    S.stop = false
+    S.generation = (S.generation or 0) + 1
+    S.lastDepth = 0
+    S.lastScore = 0
+    S.lastMove = firstLegal
+    S.lastPV = {moveToString(firstLegal)}
+    local bookMove = S.book[fen]
+    if bookMove then S.lastMove = bookMove end
+    local prev = 0
+    for depth = 1, self.MaxDepth do
+        if shouldStop() then break end
+        local alpha, beta = -INF, INF
+        if depth >= 3 and abs(prev) < 7000 then alpha, beta = prev - 70, prev + 70 end
+        local score, move, pv = rootSearch(depth, alpha, beta)
+        if S.stop then break end
+        if depth >= 3 and (score <= alpha or score >= beta) then
+            score, move, pv = rootSearch(depth, -INF, INF)
+            if S.stop then break end
+        end
+        if move ~= 0 then
+            S.lastDepth = depth
+            S.lastScore = score
+            S.lastMove = move
+            S.lastPV = pv
+            prev = score
+        end
+        yield()
+    end
+    return moveToString(S.lastMove), S.lastScore
+end
+
+function Engine:EvaluateFEN(fen)
+    if type(fen) ~= "string" then return nil end
+    parseFEN(fen)
+    return evaluate()
+end
+
+function Engine:GetPV()
+    return table.concat(S.lastPV or {}, " ")
+end
+
+function Engine:GetStats()
+    return {
+        Nodes = S.nodes or 0,
+        QNodes = S.qnodes or 0,
+        Time = S.start and clock() - S.start or 0,
+        Depth = S.lastDepth or 0,
+        Score = S.lastScore or 0,
+        Move = S.lastMove ~= 0 and moveToString(S.lastMove) or nil,
+        PV = self:GetPV(),
+        TTSize = S.TTSize
+    }
+end
+
+function Engine:GetMoveFromString(uci)
+    if type(uci) ~= "string" or #uci < 4 then return 0 end
+    local ff = string.byte(uci, 1) - 97
+    local fr = tonumber(uci:sub(2, 2))
+    local tf = string.byte(uci, 3) - 97
+    local tr = tonumber(uci:sub(4, 4))
+    if not ff or not fr or not tf or not tr then return 0 end
+    local from, to = (fr - 1) * 16 + ff, (tr - 1) * 16 + tf
+    local promo = 0
+    if #uci >= 5 then
+        local c = uci:sub(5,5):lower()
+        promo = c == "q" and QUEEN or c == "r" and ROOK or c == "b" and BISHOP or c == "n" and KNIGHT or 0
+    end
+    local flags = S.board[to] ~= 0 and CAPTURE or 0
+    if abs(S.board[from]) == PAWN and to == S.ep then flags = bor(flags, CAPTURE, EP) end
+    if abs(S.board[from]) == KING and abs(to - from) == 2 then flags = bor(flags, CASTLE) end
+    if abs(S.board[from]) == PAWN and abs(to - from) == 32 then flags = bor(flags, DOUBLE) end
+    return enc(from, to, promo, flags)
+end
+
+S.book[START_FEN] = enc(4, 36, 0, DOUBLE)
+Engine.Name = "AstraForge"
+Engine.Version = "4.0"
+Engine.Description = "Single-module aggressive Luau chess engine with PVS, iterative deepening, transposition hashing, quiescence, null move, LMR, history and killer ordering."
+Engine.Time = 0.60
+Engine.TimeMax = 3.00
+Engine.MaxDepth = 24
+Engine.NodeLimit = 170000
+Engine.NodeLimitAuto = true
+Engine.Aggression = 1.0
+Engine.Config = {Time = Engine.Time, MaxDepth = Engine.MaxDepth, NodeLimit = Engine.NodeLimit}
+ensureHistory()
+parseFEN(START_FEN)
+
+_G.__ASTRA_FORGE_API = Engine
+return Engine
